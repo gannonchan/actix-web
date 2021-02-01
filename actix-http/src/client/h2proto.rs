@@ -1,10 +1,15 @@
 use std::convert::TryFrom;
+use std::future::Future;
 use std::time;
 
 use actix_codec::{AsyncRead, AsyncWrite};
 use bytes::Bytes;
 use futures_util::future::poll_fn;
-use h2::{client::SendRequest, SendStream};
+use futures_util::pin_mut;
+use h2::{
+    client::{Builder, Connection, SendRequest},
+    SendStream,
+};
 use http::header::{HeaderValue, CONNECTION, CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::{request::Request, Method, Version};
 
@@ -13,6 +18,7 @@ use crate::header::HeaderMap;
 use crate::message::{RequestHeadType, ResponseHead};
 use crate::payload::Payload;
 
+use super::config::ConnectorConfig;
 use super::connection::{ConnectionType, IoConnection};
 use super::error::SendRequestError;
 use super::pool::Acquired;
@@ -31,10 +37,10 @@ where
     trace!("Sending client request: {:?} {:?}", head, body.size());
     let head_req = head.as_ref().method == Method::HEAD;
     let length = body.size();
-    let eof = match length {
-        BodySize::None | BodySize::Empty | BodySize::Sized(0) => true,
-        _ => false,
-    };
+    let eof = matches!(
+        length,
+        BodySize::None | BodySize::Empty | BodySize::Sized(0)
+    );
 
     let mut req = Request::new(());
     *req.uri_mut() = head.as_ref().uri.clone();
@@ -55,10 +61,6 @@ where
             .headers_mut()
             .insert(CONTENT_LENGTH, HeaderValue::from_static("0")),
         BodySize::Sized(len) => req.headers_mut().insert(
-            CONTENT_LENGTH,
-            HeaderValue::try_from(format!("{}", len)).unwrap(),
-        ),
-        BodySize::Sized64(len) => req.headers_mut().insert(
             CONTENT_LENGTH,
             HeaderValue::try_from(format!("{}", len)).unwrap(),
         ),
@@ -87,7 +89,7 @@ where
             CONNECTION | TRANSFER_ENCODING => continue, // http2 specific
             CONTENT_LENGTH if skip_len => continue,
             // DATE => has_date = true,
-            _ => (),
+            _ => {}
         }
         req.headers_mut().append(key, value.clone());
     }
@@ -123,13 +125,14 @@ where
 }
 
 async fn send_body<B: MessageBody>(
-    mut body: B,
+    body: B,
     mut send: SendStream<Bytes>,
 ) -> Result<(), SendRequestError> {
     let mut buf = None;
+    pin_mut!(body);
     loop {
         if buf.is_none() {
-            match poll_fn(|cx| body.poll_next(cx)).await {
+            match poll_fn(|cx| body.as_mut().poll_next(cx)).await {
                 Some(Ok(b)) => {
                     send.reserve_capacity(b.len());
                     buf = Some(b);
@@ -168,7 +171,7 @@ async fn send_body<B: MessageBody>(
     }
 }
 
-// release SendRequest object
+/// release SendRequest object
 fn release<T: AsyncRead + AsyncWrite + Unpin + 'static>(
     io: SendRequest<Bytes>,
     pool: Option<Acquired<T>>,
@@ -182,4 +185,19 @@ fn release<T: AsyncRead + AsyncWrite + Unpin + 'static>(
             pool.release(IoConnection::new(ConnectionType::H2(io), created, None));
         }
     }
+}
+
+pub(crate) fn handshake<Io>(
+    io: Io,
+    config: &ConnectorConfig,
+) -> impl Future<Output = Result<(SendRequest<Bytes>, Connection<Io, Bytes>), h2::Error>>
+where
+    Io: AsyncRead + AsyncWrite + Unpin + 'static,
+{
+    let mut builder = Builder::new();
+    builder
+        .initial_window_size(config.stream_window_size)
+        .initial_connection_window_size(config.conn_window_size)
+        .enable_push(false);
+    builder.handshake(io)
 }

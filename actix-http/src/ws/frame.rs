@@ -2,7 +2,6 @@ use std::convert::TryFrom;
 
 use bytes::{Buf, BufMut, BytesMut};
 use log::debug;
-use rand;
 
 use crate::ws::mask::apply_mask;
 use crate::ws::proto::{CloseCode, CloseReason, OpCode};
@@ -126,7 +125,7 @@ impl Parser {
                 debug!("Received close frame with payload length exceeding 125. Morphing to protocol close frame.");
                 return Ok(Some((true, OpCode::Close, None)));
             }
-            _ => (),
+            _ => {}
         }
 
         // unmask
@@ -230,10 +229,7 @@ mod tests {
     fn is_none(
         frm: &Result<Option<(bool, OpCode, Option<BytesMut>)>, ProtocolError>,
     ) -> bool {
-        match *frm {
-            Ok(None) => true,
-            _ => false,
-        }
+        matches!(*frm, Ok(None))
     }
 
     fn extract(

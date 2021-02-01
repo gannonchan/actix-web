@@ -1,11 +1,12 @@
 use std::cell::{Ref, RefMut};
 use std::fmt;
+use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::{Bytes, BytesMut};
-use futures_core::{ready, Future, Stream};
+use futures_core::{ready, Stream};
 
 use actix_http::cookie::Cookie;
 use actix_http::error::{CookieParseError, PayloadError};
@@ -183,7 +184,7 @@ where
         }
     }
 
-    /// Change max size of payload. By default max size is 256Kb
+    /// Change max size of payload. By default max size is 256kB
     pub fn limit(mut self, limit: usize) -> Self {
         if let Some(ref mut fut) = self.fut {
             fut.limit = limit;
@@ -233,7 +234,7 @@ pub struct JsonBody<S, U> {
     length: Option<usize>,
     err: Option<JsonPayloadError>,
     fut: Option<ReadBody<S>>,
-    _t: PhantomData<U>,
+    _phantom: PhantomData<U>,
 }
 
 impl<S, U> JsonBody<S, U>
@@ -254,7 +255,7 @@ where
                 length: None,
                 fut: None,
                 err: Some(JsonPayloadError::ContentType),
-                _t: PhantomData,
+                _phantom: PhantomData,
             };
         }
 
@@ -271,11 +272,11 @@ where
             length: len,
             err: None,
             fut: Some(ReadBody::new(req.take_payload(), 65536)),
-            _t: PhantomData,
+            _phantom: PhantomData,
         }
     }
 
-    /// Change max size of payload. By default max size is 64Kb
+    /// Change max size of payload. By default max size is 64kB
     pub fn limit(mut self, limit: usize) -> Self {
         if let Some(ref mut fut) = self.fut {
             fut.limit = limit;
@@ -369,14 +370,14 @@ mod tests {
     async fn test_body() {
         let mut req = TestResponse::with_header(header::CONTENT_LENGTH, "xxxx").finish();
         match req.body().await.err().unwrap() {
-            PayloadError::UnknownLength => (),
+            PayloadError::UnknownLength => {}
             _ => unreachable!("error"),
         }
 
         let mut req =
             TestResponse::with_header(header::CONTENT_LENGTH, "1000000").finish();
         match req.body().await.err().unwrap() {
-            PayloadError::Overflow => (),
+            PayloadError::Overflow => {}
             _ => unreachable!("error"),
         }
 
@@ -389,7 +390,7 @@ mod tests {
             .set_payload(Bytes::from_static(b"11111111111111"))
             .finish();
         match req.body().limit(5).await.err().unwrap() {
-            PayloadError::Overflow => (),
+            PayloadError::Overflow => {}
             _ => unreachable!("error"),
         }
     }
@@ -401,14 +402,12 @@ mod tests {
 
     fn json_eq(err: JsonPayloadError, other: JsonPayloadError) -> bool {
         match err {
-            JsonPayloadError::Payload(PayloadError::Overflow) => match other {
-                JsonPayloadError::Payload(PayloadError::Overflow) => true,
-                _ => false,
-            },
-            JsonPayloadError::ContentType => match other {
-                JsonPayloadError::ContentType => true,
-                _ => false,
-            },
+            JsonPayloadError::Payload(PayloadError::Overflow) => {
+                matches!(other, JsonPayloadError::Payload(PayloadError::Overflow))
+            }
+            JsonPayloadError::ContentType => {
+                matches!(other, JsonPayloadError::ContentType)
+            }
             _ => false,
         }
     }

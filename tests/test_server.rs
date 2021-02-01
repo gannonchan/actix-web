@@ -1,6 +1,9 @@
-use std::io::{Read, Write};
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::{
+    future::Future,
+    io::{Read, Write},
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use actix_http::http::header::{
     ContentEncoding, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH,
@@ -8,14 +11,16 @@ use actix_http::http::header::{
 };
 use brotli2::write::{BrotliDecoder, BrotliEncoder};
 use bytes::Bytes;
-use flate2::read::GzDecoder;
-use flate2::write::{GzEncoder, ZlibDecoder, ZlibEncoder};
-use flate2::Compression;
-use futures::{ready, Future};
+use flate2::{
+    read::GzDecoder,
+    write::{GzEncoder, ZlibDecoder, ZlibEncoder},
+    Compression,
+};
+use futures_util::ready;
 use rand::{distributions::Alphanumeric, Rng};
 
 use actix_web::dev::BodyEncoding;
-use actix_web::middleware::Compress;
+use actix_web::middleware::{Compress, NormalizePath, TrailingSlash};
 use actix_web::{dev, test, web, App, Error, HttpResponse};
 
 const STR: &str = "Hello World Hello World Hello World Hello World Hello World \
@@ -43,7 +48,7 @@ const STR: &str = "Hello World Hello World Hello World Hello World Hello World \
 struct TestBody {
     data: Bytes,
     chunk_size: usize,
-    delay: actix_rt::time::Delay,
+    delay: Pin<Box<actix_rt::time::Sleep>>,
 }
 
 impl TestBody {
@@ -51,12 +56,12 @@ impl TestBody {
         TestBody {
             data,
             chunk_size,
-            delay: actix_rt::time::delay_for(std::time::Duration::from_millis(10)),
+            delay: Box::pin(actix_rt::time::sleep(std::time::Duration::from_millis(10))),
         }
     }
 }
 
-impl futures::Stream for TestBody {
+impl futures_core::stream::Stream for TestBody {
     type Item = Result<Bytes, Error>;
 
     fn poll_next(
@@ -65,7 +70,8 @@ impl futures::Stream for TestBody {
     ) -> Poll<Option<Self::Item>> {
         ready!(Pin::new(&mut self.delay).poll(cx));
 
-        self.delay = actix_rt::time::delay_for(std::time::Duration::from_millis(10));
+        self.delay =
+            Box::pin(actix_rt::time::sleep(std::time::Duration::from_millis(10)));
         let chunk_size = std::cmp::min(self.chunk_size, self.data.len());
         let chunk = self.data.split_to(chunk_size);
         if chunk.is_empty() {
@@ -102,7 +108,7 @@ async fn test_body_gzip() {
     let mut response = srv
         .get("/")
         .no_decompress()
-        .header(ACCEPT_ENCODING, "gzip")
+        .append_header((ACCEPT_ENCODING, "gzip"))
         .send()
         .await
         .unwrap();
@@ -131,7 +137,7 @@ async fn test_body_gzip2() {
     let mut response = srv
         .get("/")
         .no_decompress()
-        .header(ACCEPT_ENCODING, "gzip")
+        .append_header((ACCEPT_ENCODING, "gzip"))
         .send()
         .await
         .unwrap();
@@ -172,7 +178,7 @@ async fn test_body_encoding_override() {
     let mut response = srv
         .get("/")
         .no_decompress()
-        .header(ACCEPT_ENCODING, "deflate")
+        .append_header((ACCEPT_ENCODING, "deflate"))
         .send()
         .await
         .unwrap();
@@ -191,7 +197,7 @@ async fn test_body_encoding_override() {
     let mut response = srv
         .request(actix_web::http::Method::GET, srv.url("/raw"))
         .no_decompress()
-        .header(ACCEPT_ENCODING, "deflate")
+        .append_header((ACCEPT_ENCODING, "deflate"))
         .send()
         .await
         .unwrap();
@@ -225,7 +231,7 @@ async fn test_body_gzip_large() {
     let mut response = srv
         .get("/")
         .no_decompress()
-        .header(ACCEPT_ENCODING, "gzip")
+        .append_header((ACCEPT_ENCODING, "gzip"))
         .send()
         .await
         .unwrap();
@@ -246,6 +252,7 @@ async fn test_body_gzip_large_random() {
     let data = rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(70_000)
+        .map(char::from)
         .collect::<String>();
     let srv_data = data.clone();
 
@@ -262,7 +269,7 @@ async fn test_body_gzip_large_random() {
     let mut response = srv
         .get("/")
         .no_decompress()
-        .header(ACCEPT_ENCODING, "gzip")
+        .append_header((ACCEPT_ENCODING, "gzip"))
         .send()
         .await
         .unwrap();
@@ -293,7 +300,7 @@ async fn test_body_chunked_implicit() {
     let mut response = srv
         .get("/")
         .no_decompress()
-        .header(ACCEPT_ENCODING, "gzip")
+        .append_header((ACCEPT_ENCODING, "gzip"))
         .send()
         .await
         .unwrap();
@@ -326,7 +333,7 @@ async fn test_body_br_streaming() {
 
     let mut response = srv
         .get("/")
-        .header(ACCEPT_ENCODING, "br")
+        .append_header((ACCEPT_ENCODING, "br"))
         .no_decompress()
         .send()
         .await
@@ -348,9 +355,10 @@ async fn test_body_br_streaming() {
 #[actix_rt::test]
 async fn test_head_binary() {
     let srv = test::start_with(test::config().h1(), || {
-        App::new().service(web::resource("/").route(
-            web::head().to(move || HttpResponse::Ok().content_length(100).body(STR)),
-        ))
+        App::new().service(
+            web::resource("/")
+                .route(web::head().to(move || HttpResponse::Ok().body(STR))),
+        )
     });
 
     let mut response = srv.head("/").send().await.unwrap();
@@ -371,8 +379,7 @@ async fn test_no_chunking() {
     let srv = test::start_with(test::config().h1(), || {
         App::new().service(web::resource("/").route(web::to(move || {
             HttpResponse::Ok()
-                .no_chunking()
-                .content_length(STR.len() as u64)
+                .no_chunking(STR.len() as u64)
                 .streaming(TestBody::new(Bytes::from_static(STR.as_ref()), 24))
         })))
     });
@@ -399,7 +406,7 @@ async fn test_body_deflate() {
     // client request
     let mut response = srv
         .get("/")
-        .header(ACCEPT_ENCODING, "deflate")
+        .append_header((ACCEPT_ENCODING, "deflate"))
         .no_decompress()
         .send()
         .await
@@ -426,7 +433,7 @@ async fn test_body_brotli() {
     // client request
     let mut response = srv
         .get("/")
-        .header(ACCEPT_ENCODING, "br")
+        .append_header((ACCEPT_ENCODING, "br"))
         .no_decompress()
         .send()
         .await
@@ -459,7 +466,7 @@ async fn test_encoding() {
 
     let request = srv
         .post("/")
-        .header(CONTENT_ENCODING, "gzip")
+        .insert_header((CONTENT_ENCODING, "gzip"))
         .send_body(enc.clone());
     let mut response = request.await.unwrap();
     assert!(response.status().is_success());
@@ -485,7 +492,7 @@ async fn test_gzip_encoding() {
 
     let request = srv
         .post("/")
-        .header(CONTENT_ENCODING, "gzip")
+        .append_header((CONTENT_ENCODING, "gzip"))
         .send_body(enc.clone());
     let mut response = request.await.unwrap();
     assert!(response.status().is_success());
@@ -512,7 +519,7 @@ async fn test_gzip_encoding_large() {
 
     let request = srv
         .post("/")
-        .header(CONTENT_ENCODING, "gzip")
+        .append_header((CONTENT_ENCODING, "gzip"))
         .send_body(enc.clone());
     let mut response = request.await.unwrap();
     assert!(response.status().is_success());
@@ -527,6 +534,7 @@ async fn test_reading_gzip_encoding_large_random() {
     let data = rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(60_000)
+        .map(char::from)
         .collect::<String>();
 
     let srv = test::start_with(test::config().h1(), || {
@@ -543,7 +551,7 @@ async fn test_reading_gzip_encoding_large_random() {
 
     let request = srv
         .post("/")
-        .header(CONTENT_ENCODING, "gzip")
+        .append_header((CONTENT_ENCODING, "gzip"))
         .send_body(enc.clone());
     let mut response = request.await.unwrap();
     assert!(response.status().is_success());
@@ -570,7 +578,7 @@ async fn test_reading_deflate_encoding() {
     // client request
     let request = srv
         .post("/")
-        .header(CONTENT_ENCODING, "deflate")
+        .append_header((CONTENT_ENCODING, "deflate"))
         .send_body(enc.clone());
     let mut response = request.await.unwrap();
     assert!(response.status().is_success());
@@ -597,7 +605,7 @@ async fn test_reading_deflate_encoding_large() {
     // client request
     let request = srv
         .post("/")
-        .header(CONTENT_ENCODING, "deflate")
+        .append_header((CONTENT_ENCODING, "deflate"))
         .send_body(enc.clone());
     let mut response = request.await.unwrap();
     assert!(response.status().is_success());
@@ -612,6 +620,7 @@ async fn test_reading_deflate_encoding_large_random() {
     let data = rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(160_000)
+        .map(char::from)
         .collect::<String>();
 
     let srv = test::start_with(test::config().h1(), || {
@@ -628,7 +637,7 @@ async fn test_reading_deflate_encoding_large_random() {
     // client request
     let request = srv
         .post("/")
-        .header(CONTENT_ENCODING, "deflate")
+        .append_header((CONTENT_ENCODING, "deflate"))
         .send_body(enc.clone());
     let mut response = request.await.unwrap();
     assert!(response.status().is_success());
@@ -655,7 +664,7 @@ async fn test_brotli_encoding() {
     // client request
     let request = srv
         .post("/")
-        .header(CONTENT_ENCODING, "br")
+        .append_header((CONTENT_ENCODING, "br"))
         .send_body(enc.clone());
     let mut response = request.await.unwrap();
     assert!(response.status().is_success());
@@ -670,6 +679,7 @@ async fn test_brotli_encoding_large() {
     let data = rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(320_000)
+        .map(char::from)
         .collect::<String>();
 
     let srv = test::start_with(test::config().h1(), || {
@@ -689,7 +699,7 @@ async fn test_brotli_encoding_large() {
     // client request
     let request = srv
         .post("/")
-        .header(CONTENT_ENCODING, "br")
+        .append_header((CONTENT_ENCODING, "br"))
         .send_body(enc.clone());
     let mut response = request.await.unwrap();
     assert!(response.status().is_success());
@@ -729,7 +739,7 @@ async fn test_brotli_encoding_large_openssl() {
     // client request
     let mut response = srv
         .post("/")
-        .header(actix_web::http::header::CONTENT_ENCODING, "br")
+        .append_header((actix_web::http::header::CONTENT_ENCODING, "br"))
         .send_body(enc)
         .await
         .unwrap();
@@ -751,6 +761,7 @@ async fn test_reading_deflate_encoding_large_random_rustls() {
     let data = rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(160_000)
+        .map(char::from)
         .collect::<String>();
 
     // load ssl keys
@@ -777,7 +788,7 @@ async fn test_reading_deflate_encoding_large_random_rustls() {
     // client request
     let req = srv
         .post("/")
-        .header(actix_web::http::header::CONTENT_ENCODING, "deflate")
+        .insert_header((actix_web::http::header::CONTENT_ENCODING, "deflate"))
         .send_stream(TestBody::new(Bytes::from(enc), 1024));
 
     let mut response = req.await.unwrap();
@@ -789,68 +800,65 @@ async fn test_reading_deflate_encoding_large_random_rustls() {
     assert_eq!(bytes, Bytes::from(data));
 }
 
-// #[test]
-// fn test_server_cookies() {
-//     use actix_web::http;
+#[actix_rt::test]
+async fn test_server_cookies() {
+    use actix_web::{http, HttpMessage};
 
-//     let srv = test::TestServer::with_factory(|| {
-//         App::new().resource("/", |r| {
-//             r.f(|_| {
-//                 HttpResponse::Ok()
-//                     .cookie(
-//                         http::CookieBuilder::new("first", "first_value")
-//                             .http_only(true)
-//                             .finish(),
-//                     )
-//                     .cookie(http::Cookie::new("second", "first_value"))
-//                     .cookie(http::Cookie::new("second", "second_value"))
-//                     .finish()
-//             })
-//         })
-//     });
+    let srv = test::start(|| {
+        App::new().default_service(web::to(|| {
+            HttpResponse::Ok()
+                .cookie(
+                    http::CookieBuilder::new("first", "first_value")
+                        .http_only(true)
+                        .finish(),
+                )
+                .cookie(http::Cookie::new("second", "first_value"))
+                .cookie(http::Cookie::new("second", "second_value"))
+                .finish()
+        }))
+    });
 
-//     let first_cookie = http::CookieBuilder::new("first", "first_value")
-//         .http_only(true)
-//         .finish();
-//     let second_cookie = http::Cookie::new("second", "second_value");
+    let first_cookie = http::CookieBuilder::new("first", "first_value")
+        .http_only(true)
+        .finish();
+    let second_cookie = http::Cookie::new("second", "second_value");
 
-//     let request = srv.get("/").finish().unwrap();
-//     let response = srv.execute(request.send()).unwrap();
-//     assert!(response.status().is_success());
+    let req = srv.get("/");
+    let res = req.send().await.unwrap();
+    assert!(res.status().is_success());
 
-//     let cookies = response.cookies().expect("To have cookies");
-//     assert_eq!(cookies.len(), 2);
-//     if cookies[0] == first_cookie {
-//         assert_eq!(cookies[1], second_cookie);
-//     } else {
-//         assert_eq!(cookies[0], second_cookie);
-//         assert_eq!(cookies[1], first_cookie);
-//     }
+    let cookies = res.cookies().expect("To have cookies");
+    assert_eq!(cookies.len(), 2);
+    if cookies[0] == first_cookie {
+        assert_eq!(cookies[1], second_cookie);
+    } else {
+        assert_eq!(cookies[0], second_cookie);
+        assert_eq!(cookies[1], first_cookie);
+    }
 
-//     let first_cookie = first_cookie.to_string();
-//     let second_cookie = second_cookie.to_string();
-//     //Check that we have exactly two instances of raw cookie headers
-//     let cookies = response
-//         .headers()
-//         .get_all(http::header::SET_COOKIE)
-//         .iter()
-//         .map(|header| header.to_str().expect("To str").to_string())
-//         .collect::<Vec<_>>();
-//     assert_eq!(cookies.len(), 2);
-//     if cookies[0] == first_cookie {
-//         assert_eq!(cookies[1], second_cookie);
-//     } else {
-//         assert_eq!(cookies[0], second_cookie);
-//         assert_eq!(cookies[1], first_cookie);
-//     }
-// }
+    let first_cookie = first_cookie.to_string();
+    let second_cookie = second_cookie.to_string();
+    // Check that we have exactly two instances of raw cookie headers
+    let cookies = res
+        .headers()
+        .get_all(http::header::SET_COOKIE)
+        .map(|header| header.to_str().expect("To str").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(cookies.len(), 2);
+    if cookies[0] == first_cookie {
+        assert_eq!(cookies[1], second_cookie);
+    } else {
+        assert_eq!(cookies[0], second_cookie);
+        assert_eq!(cookies[1], first_cookie);
+    }
+}
 
 #[actix_rt::test]
 async fn test_slow_request() {
     use std::net;
 
     let srv = test::start_with(test::config().client_timeout(200), || {
-        App::new().service(web::resource("/").route(web::to(|| HttpResponse::Ok())))
+        App::new().service(web::resource("/").route(web::to(HttpResponse::Ok)))
     });
 
     let mut stream = net::TcpStream::connect(srv.addr()).unwrap();
@@ -865,27 +873,16 @@ async fn test_slow_request() {
     assert!(data.starts_with("HTTP/1.1 408 Request Timeout"));
 }
 
-// #[cfg(feature = "openssl")]
-// #[actix_rt::test]
-// async fn test_ssl_handshake_timeout() {
-//     use open_ssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
-//     use std::net;
+#[actix_rt::test]
+async fn test_normalize() {
+    let srv = test::start_with(test::config().h1(), || {
+        App::new()
+            .wrap(NormalizePath::new(TrailingSlash::Trim))
+            .service(
+                web::resource("/one").route(web::to(|| HttpResponse::Ok().finish())),
+            )
+    });
 
-//     // load ssl keys
-//     let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
-//     builder
-//         .set_private_key_file("tests/key.pem", SslFiletype::PEM)
-//         .unwrap();
-//     builder
-//         .set_certificate_chain_file("tests/cert.pem")
-//         .unwrap();
-
-//     let srv = test::start_with(test::config().openssl(builder.build()), || {
-//         App::new().service(web::resource("/").route(web::to(|| HttpResponse::Ok())))
-//     });
-
-//     let mut stream = net::TcpStream::connect(srv.addr()).unwrap();
-//     let mut data = String::new();
-//     let _ = stream.read_to_string(&mut data);
-//     assert!(data.is_empty());
-// }
+    let response = srv.get("/one/").send().await.unwrap();
+    assert!(response.status().is_success());
+}

@@ -4,11 +4,11 @@ use std::ptr::copy_nonoverlapping;
 use std::slice::from_raw_parts_mut;
 use std::{cmp, io};
 
-use bytes::{buf::BufMutExt, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 
 use crate::body::BodySize;
 use crate::config::ServiceConfig;
-use crate::header::map;
+use crate::header::{map::Value, HeaderName};
 use crate::helpers;
 use crate::http::header::{CONNECTION, CONTENT_LENGTH, DATE, TRANSFER_ENCODING};
 use crate::http::{HeaderMap, StatusCode, Version};
@@ -21,7 +21,7 @@ const AVERAGE_HEADER_SIZE: usize = 30;
 pub(crate) struct MessageEncoder<T: MessageType> {
     pub length: BodySize,
     pub te: TransferEncoding,
-    _t: PhantomData<T>,
+    _phantom: PhantomData<T>,
 }
 
 impl<T: MessageType> Default for MessageEncoder<T> {
@@ -29,7 +29,7 @@ impl<T: MessageType> Default for MessageEncoder<T> {
         MessageEncoder {
             length: BodySize::None,
             te: TransferEncoding::empty(),
-            _t: PhantomData,
+            _phantom: PhantomData,
         }
     }
 }
@@ -64,14 +64,17 @@ pub(crate) trait MessageType: Sized {
         // Content length
         if let Some(status) = self.status() {
             match status {
-                StatusCode::NO_CONTENT
-                | StatusCode::CONTINUE
-                | StatusCode::PROCESSING => length = BodySize::None,
-                StatusCode::SWITCHING_PROTOCOLS => {
+                StatusCode::CONTINUE
+                | StatusCode::SWITCHING_PROTOCOLS
+                | StatusCode::PROCESSING
+                | StatusCode::NO_CONTENT => {
+                    // skip content-length and transfer-encoding headers
+                    // See https://tools.ietf.org/html/rfc7230#section-3.3.1
+                    // and https://tools.ietf.org/html/rfc7230#section-3.3.2
                     skip_len = true;
-                    length = BodySize::Stream;
+                    length = BodySize::None
                 }
-                _ => (),
+                _ => {}
             }
         }
         match length {
@@ -95,15 +98,6 @@ pub(crate) trait MessageType: Sized {
                 }
             }
             BodySize::Sized(len) => helpers::write_content_length(len, dst),
-            BodySize::Sized64(len) => {
-                if camel_case {
-                    dst.put_slice(b"\r\nContent-Length: ");
-                } else {
-                    dst.put_slice(b"\r\ncontent-length: ");
-                }
-                #[allow(clippy::write_with_newline)]
-                write!(dst.writer(), "{}\r\n", len)?;
-            }
             BodySize::None => dst.put_slice(b"\r\n"),
         }
 
@@ -124,103 +118,137 @@ pub(crate) trait MessageType: Sized {
                     dst.put_slice(b"connection: close\r\n")
                 }
             }
-            _ => (),
+            _ => {}
         }
 
-        // merging headers from head and extra headers. HeaderMap::new() does not allocate.
-        let empty_headers = HeaderMap::new();
-        let extra_headers = self.extra_headers().unwrap_or(&empty_headers);
-        let headers = self
-            .headers()
-            .inner
-            .iter()
-            .filter(|(name, _)| !extra_headers.contains_key(*name))
-            .chain(extra_headers.inner.iter());
-
         // write headers
-        let mut pos = 0;
+
         let mut has_date = false;
+
+        let mut buf = dst.chunk_mut().as_mut_ptr();
         let mut remaining = dst.capacity() - dst.len();
-        let mut buf = dst.bytes_mut().as_mut_ptr() as *mut u8;
-        for (key, value) in headers {
+
+        // tracks bytes written since last buffer resize
+        // since buf is a raw pointer to a bytes container storage but is written to without the
+        // container's knowledge, this is used to sync the containers cursor after data is written
+        let mut pos = 0;
+
+        self.write_headers(|key, value| {
             match *key {
-                CONNECTION => continue,
-                TRANSFER_ENCODING | CONTENT_LENGTH if skip_len => continue,
-                DATE => {
-                    has_date = true;
-                }
-                _ => (),
+                CONNECTION => return,
+                TRANSFER_ENCODING | CONTENT_LENGTH if skip_len => return,
+                DATE => has_date = true,
+                _ => {}
             }
+
             let k = key.as_str().as_bytes();
+            let k_len = k.len();
+
             match value {
-                map::Value::One(ref val) => {
+                Value::One(ref val) => {
                     let v = val.as_ref();
                     let v_len = v.len();
-                    let k_len = k.len();
+
+                    // key length + value length + colon + space + \r\n
                     let len = k_len + v_len + 4;
+
                     if len > remaining {
+                        // not enough room in buffer for this header; reserve more space
+
+                        // SAFETY: all the bytes written up to position "pos" are initialized
+                        // the written byte count and pointer advancement are kept in sync
                         unsafe {
                             dst.advance_mut(pos);
                         }
+
                         pos = 0;
                         dst.reserve(len * 2);
                         remaining = dst.capacity() - dst.len();
-                        buf = dst.bytes_mut().as_mut_ptr() as *mut u8;
+
+                        // re-assign buf raw pointer since it's possible that the buffer was
+                        // reallocated and/or resized
+                        buf = dst.chunk_mut().as_mut_ptr();
                     }
-                    // use upper Camel-Case
+
+                    // SAFETY: on each write, it is enough to ensure that the advancement of the
+                    // cursor matches the number of bytes written
                     unsafe {
+                        // use upper Camel-Case
                         if camel_case {
                             write_camel_case(k, from_raw_parts_mut(buf, k_len))
                         } else {
                             write_data(k, buf, k_len)
                         }
+
                         buf = buf.add(k_len);
+
                         write_data(b": ", buf, 2);
                         buf = buf.add(2);
+
                         write_data(v, buf, v_len);
                         buf = buf.add(v_len);
+
                         write_data(b"\r\n", buf, 2);
                         buf = buf.add(2);
-                        pos += len;
-                        remaining -= len;
                     }
+
+                    pos += len;
+                    remaining -= len;
                 }
-                map::Value::Multi(ref vec) => {
+
+                Value::Multi(ref vec) => {
                     for val in vec {
                         let v = val.as_ref();
                         let v_len = v.len();
-                        let k_len = k.len();
                         let len = k_len + v_len + 4;
+
                         if len > remaining {
+                            // SAFETY: all the bytes written up to position "pos" are initialized
+                            // the written byte count and pointer advancement are kept in sync
                             unsafe {
                                 dst.advance_mut(pos);
                             }
                             pos = 0;
                             dst.reserve(len * 2);
                             remaining = dst.capacity() - dst.len();
-                            buf = dst.bytes_mut().as_mut_ptr() as *mut u8;
+
+                            // re-assign buf raw pointer since it's possible that the buffer was
+                            // reallocated and/or resized
+                            buf = dst.chunk_mut().as_mut_ptr();
                         }
-                        // use upper Camel-Case
+
+                        // SAFETY: on each write, it is enough to ensure that the advancement of
+                        // the cursor matches the number of bytes written
                         unsafe {
                             if camel_case {
                                 write_camel_case(k, from_raw_parts_mut(buf, k_len));
                             } else {
                                 write_data(k, buf, k_len);
                             }
+
                             buf = buf.add(k_len);
+
                             write_data(b": ", buf, 2);
                             buf = buf.add(2);
+
                             write_data(v, buf, v_len);
                             buf = buf.add(v_len);
+
                             write_data(b"\r\n", buf, 2);
                             buf = buf.add(2);
                         };
+
                         pos += len;
                         remaining -= len;
                     }
                 }
             }
-        }
+        });
+
+        // final cursor synchronization with the bytes container
+        //
+        // SAFETY: all the bytes written up to position "pos" are initialized
+        // the written byte count and pointer advancement are kept in sync
         unsafe {
             dst.advance_mut(pos);
         }
@@ -234,6 +262,24 @@ pub(crate) trait MessageType: Sized {
         }
 
         Ok(())
+    }
+
+    fn write_headers<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&HeaderName, &Value),
+    {
+        match self.extra_headers() {
+            Some(headers) => {
+                // merging headers from head and extra headers.
+                self.headers()
+                    .inner
+                    .iter()
+                    .filter(|(name, _)| !headers.contains_key(*name))
+                    .chain(headers.inner.iter())
+                    .for_each(|(k, v)| f(k, v))
+            }
+            None => self.headers().inner.iter().for_each(|(k, v)| f(k, v)),
+        }
     }
 }
 
@@ -338,8 +384,7 @@ impl<T: MessageType> MessageEncoder<T> {
         if !head {
             self.te = match length {
                 BodySize::Empty => TransferEncoding::empty(),
-                BodySize::Sized(len) => TransferEncoding::length(len as u64),
-                BodySize::Sized64(len) => TransferEncoding::length(len),
+                BodySize::Sized(len) => TransferEncoding::length(len),
                 BodySize::Stream => {
                     if message.chunked() && !stream {
                         TransferEncoding::chunked()
@@ -487,35 +532,37 @@ impl<'a> io::Write for Writer<'a> {
     }
 }
 
+/// # Safety
+/// Callers must ensure that the given length matches given value length.
 unsafe fn write_data(value: &[u8], buf: *mut u8, len: usize) {
+    debug_assert_eq!(value.len(), len);
     copy_nonoverlapping(value.as_ptr(), buf, len);
 }
 
 fn write_camel_case(value: &[u8], buffer: &mut [u8]) {
-    let mut index = 0;
-    let key = value;
-    let mut key_iter = key.iter();
+    // first copy entire (potentially wrong) slice to output
+    buffer[..value.len()].copy_from_slice(value);
 
-    if let Some(c) = key_iter.next() {
-        if *c >= b'a' && *c <= b'z' {
-            buffer[index] = *c ^ b' ';
-            index += 1;
-        }
-    } else {
-        return;
+    let mut iter = value.iter();
+
+    // first character should be uppercase
+    if let Some(c @ b'a'..=b'z') = iter.next() {
+        buffer[0] = c & 0b1101_1111;
     }
 
-    while let Some(c) = key_iter.next() {
-        buffer[index] = *c;
-        index += 1;
-        if *c == b'-' {
-            if let Some(c) = key_iter.next() {
-                if *c >= b'a' && *c <= b'z' {
-                    buffer[index] = *c ^ b' ';
-                    index += 1;
-                }
+    // track 1 ahead of the current position since that's the location being assigned to
+    let mut index = 2;
+
+    // remaining characters after hyphens should also be uppercase
+    while let Some(&c) = iter.next() {
+        if c == b'-' {
+            // advance iter by one and uppercase if needed
+            if let Some(c @ b'a'..=b'z') = iter.next() {
+                buffer[index] = c & 0b1101_1111;
             }
         }
+
+        index += 1;
     }
 }
 
@@ -564,6 +611,8 @@ mod tests {
         );
         let data =
             String::from_utf8(Vec::from(bytes.split().freeze().as_ref())).unwrap();
+        eprintln!("{}", &data);
+
         assert!(data.contains("Content-Length: 0\r\n"));
         assert!(data.contains("Connection: close\r\n"));
         assert!(data.contains("Content-Type: plain/text\r\n"));
@@ -579,19 +628,6 @@ mod tests {
         let data =
             String::from_utf8(Vec::from(bytes.split().freeze().as_ref())).unwrap();
         assert!(data.contains("Transfer-Encoding: chunked\r\n"));
-        assert!(data.contains("Content-Type: plain/text\r\n"));
-        assert!(data.contains("Date: date\r\n"));
-
-        let _ = head.encode_headers(
-            &mut bytes,
-            Version::HTTP_11,
-            BodySize::Sized64(100),
-            ConnectionType::KeepAlive,
-            &ServiceConfig::default(),
-        );
-        let data =
-            String::from_utf8(Vec::from(bytes.split().freeze().as_ref())).unwrap();
-        assert!(data.contains("Content-Length: 100\r\n"));
         assert!(data.contains("Content-Type: plain/text\r\n"));
         assert!(data.contains("Date: date\r\n"));
 
@@ -651,5 +687,29 @@ mod tests {
         assert!(data.contains("connection: close\r\n"));
         assert!(data.contains("authorization: another authorization\r\n"));
         assert!(data.contains("date: date\r\n"));
+    }
+
+    #[test]
+    fn test_no_content_length() {
+        let mut bytes = BytesMut::with_capacity(2048);
+
+        let mut res: Response<()> =
+            Response::new(StatusCode::SWITCHING_PROTOCOLS).into_body::<()>();
+        res.headers_mut()
+            .insert(DATE, HeaderValue::from_static(&""));
+        res.headers_mut()
+            .insert(CONTENT_LENGTH, HeaderValue::from_static(&"0"));
+
+        let _ = res.encode_headers(
+            &mut bytes,
+            Version::HTTP_11,
+            BodySize::Stream,
+            ConnectionType::Upgrade,
+            &ServiceConfig::default(),
+        );
+        let data =
+            String::from_utf8(Vec::from(bytes.split().freeze().as_ref())).unwrap();
+        assert!(!data.contains("content-length: 0\r\n"));
+        assert!(!data.contains("transfer-encoding: chunked\r\n"));
     }
 }

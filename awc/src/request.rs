@@ -1,20 +1,18 @@
 use std::convert::TryFrom;
-use std::fmt::Write as FmtWrite;
 use std::rc::Rc;
 use std::time::Duration;
 use std::{fmt, net};
 
 use bytes::Bytes;
 use futures_core::Stream;
-use percent_encoding::percent_encode;
 use serde::Serialize;
 
 use actix_http::body::Body;
-use actix_http::cookie::{Cookie, CookieJar, USERINFO};
-use actix_http::http::header::{self, Header, IntoHeaderValue};
+use actix_http::cookie::{Cookie, CookieJar};
+use actix_http::http::header::{self, IntoHeaderPair};
 use actix_http::http::{
-    uri, ConnectionType, Error as HttpError, HeaderMap, HeaderName, HeaderValue, Method,
-    Uri, Version,
+    uri, ConnectionType, Error as HttpError, HeaderMap, HeaderValue, Method, Uri,
+    Version,
 };
 use actix_http::{Error, RequestHead};
 
@@ -23,10 +21,15 @@ use crate::frozen::FrozenClientRequest;
 use crate::sender::{PrepForSendingError, RequestSender, SendClientRequest};
 use crate::ClientConfig;
 
-#[cfg(any(feature = "flate2-zlib", feature = "flate2-rust"))]
-const HTTPS_ENCODING: &str = "br, gzip, deflate";
-#[cfg(not(any(feature = "flate2-zlib", feature = "flate2-rust")))]
-const HTTPS_ENCODING: &str = "br";
+cfg_if::cfg_if! {
+    if #[cfg(any(feature = "flate2-zlib", feature = "flate2-rust"))] {
+        const HTTPS_ENCODING: &str = "br, gzip, deflate";
+    } else if #[cfg(feature = "compress")] {
+        const HTTPS_ENCODING: &str = "br";
+    } else {
+        const HTTPS_ENCODING: &str = "identity";
+    }
+}
 
 /// An HTTP Client request builder
 ///
@@ -34,13 +37,11 @@ const HTTPS_ENCODING: &str = "br";
 /// builder-like pattern.
 ///
 /// ```rust
-/// use actix_rt::System;
-///
 /// #[actix_rt::main]
 /// async fn main() {
 ///    let response = awc::Client::new()
 ///         .get("http://www.rust-lang.org") // <- Create request builder
-///         .header("User-Agent", "Actix-web")
+///         .insert_header(("User-Agent", "Actix-web"))
 ///         .send()                          // <- Send http request
 ///         .await;
 ///
@@ -140,110 +141,71 @@ impl ClientRequest {
         &self.head.peer_addr
     }
 
-    #[inline]
     /// Returns request's headers.
+    #[inline]
     pub fn headers(&self) -> &HeaderMap {
         &self.head.headers
     }
 
-    #[inline]
     /// Returns request's mutable headers.
+    #[inline]
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
         &mut self.head.headers
     }
 
-    /// Set a header.
-    ///
-    /// ```rust
-    /// fn main() {
-    /// # actix_rt::System::new("test").block_on(futures::future::lazy(|_| {
-    ///     let req = awc::Client::new()
-    ///         .get("http://www.rust-lang.org")
-    ///         .set(awc::http::header::Date::now())
-    ///         .set(awc::http::header::ContentType(mime::TEXT_HTML));
-    /// #   Ok::<_, ()>(())
-    /// # }));
-    /// }
-    /// ```
-    pub fn set<H: Header>(mut self, hdr: H) -> Self {
-        match hdr.try_into() {
-            Ok(value) => {
-                self.head.headers.insert(H::name(), value);
-            }
-            Err(e) => self.err = Some(e.into()),
-        }
-        self
-    }
-
-    /// Append a header.
-    ///
-    /// Header gets appended to existing header.
-    /// To override header use `set_header()` method.
-    ///
-    /// ```rust
-    /// use awc::{http, Client};
-    ///
-    /// fn main() {
-    /// # actix_rt::System::new("test").block_on(async {
-    ///     let req = Client::new()
-    ///         .get("http://www.rust-lang.org")
-    ///         .header("X-TEST", "value")
-    ///         .header(http::header::CONTENT_TYPE, "application/json");
-    /// #   Ok::<_, ()>(())
-    /// # });
-    /// }
-    /// ```
-    pub fn header<K, V>(mut self, key: K, value: V) -> Self
+    /// Insert a header, replacing any that were set with an equivalent field name.
+    pub fn insert_header<H>(mut self, header: H) -> Self
     where
-        HeaderName: TryFrom<K>,
-        <HeaderName as TryFrom<K>>::Error: Into<HttpError>,
-        V: IntoHeaderValue,
+        H: IntoHeaderPair,
     {
-        match HeaderName::try_from(key) {
-            Ok(key) => match value.try_into() {
-                Ok(value) => self.head.headers.append(key, value),
-                Err(e) => self.err = Some(e.into()),
-            },
+        match header.try_into_header_pair() {
+            Ok((key, value)) => self.head.headers.insert(key, value),
             Err(e) => self.err = Some(e.into()),
-        }
-        self
-    }
+        };
 
-    /// Insert a header, replaces existing header.
-    pub fn set_header<K, V>(mut self, key: K, value: V) -> Self
-    where
-        HeaderName: TryFrom<K>,
-        <HeaderName as TryFrom<K>>::Error: Into<HttpError>,
-        V: IntoHeaderValue,
-    {
-        match HeaderName::try_from(key) {
-            Ok(key) => match value.try_into() {
-                Ok(value) => self.head.headers.insert(key, value),
-                Err(e) => self.err = Some(e.into()),
-            },
-            Err(e) => self.err = Some(e.into()),
-        }
         self
     }
 
     /// Insert a header only if it is not yet set.
-    pub fn set_header_if_none<K, V>(mut self, key: K, value: V) -> Self
+    pub fn insert_header_if_none<H>(mut self, header: H) -> Self
     where
-        HeaderName: TryFrom<K>,
-        <HeaderName as TryFrom<K>>::Error: Into<HttpError>,
-        V: IntoHeaderValue,
+        H: IntoHeaderPair,
     {
-        match HeaderName::try_from(key) {
-            Ok(key) => {
+        match header.try_into_header_pair() {
+            Ok((key, value)) => {
                 if !self.head.headers.contains_key(&key) {
-                    match value.try_into() {
-                        Ok(value) => self.head.headers.insert(key, value),
-                        Err(e) => self.err = Some(e.into()),
-                    }
+                    self.head.headers.insert(key, value);
                 }
             }
             Err(e) => self.err = Some(e.into()),
-        }
+        };
+
+        self
+    }
+
+    /// Append a header, keeping any that were set with an equivalent field name.
+    ///
+    /// ```rust
+    /// # #[actix_rt::main]
+    /// # async fn main() {
+    /// # use awc::Client;
+    /// use awc::http::header::ContentType;
+    ///
+    /// Client::new()
+    ///     .get("http://www.rust-lang.org")
+    ///     .insert_header(("X-TEST", "value"))
+    ///     .insert_header(ContentType(mime::APPLICATION_JSON));
+    /// # }
+    /// ```
+    pub fn append_header<H>(mut self, header: H) -> Self
+    where
+        H: IntoHeaderPair,
+    {
+        match header.try_into_header_pair() {
+            Ok((key, value)) => self.head.headers.append(key, value),
+            Err(e) => self.err = Some(e.into()),
+        };
+
         self
     }
 
@@ -279,7 +241,7 @@ impl ClientRequest {
     /// Set content length
     #[inline]
     pub fn content_length(self, len: u64) -> Self {
-        self.header(header::CONTENT_LENGTH, len)
+        self.append_header((header::CONTENT_LENGTH, len))
     }
 
     /// Set HTTP basic authorization header
@@ -291,10 +253,10 @@ impl ClientRequest {
             Some(password) => format!("{}:{}", username, password),
             None => format!("{}:", username),
         };
-        self.header(
+        self.append_header((
             header::AUTHORIZATION,
             format!("Basic {}", base64::encode(&auth)),
-        )
+        ))
     }
 
     /// Set HTTP bearer authentication header
@@ -302,7 +264,7 @@ impl ClientRequest {
     where
         T: fmt::Display,
     {
-        self.header(header::AUTHORIZATION, format!("Bearer {}", token))
+        self.append_header((header::AUTHORIZATION, format!("Bearer {}", token)))
     }
 
     /// Set a cookie
@@ -351,8 +313,9 @@ impl ClientRequest {
         self
     }
 
-    /// This method calls provided closure with builder reference if
-    /// value is `true`.
+    /// This method calls provided closure with builder reference if value is `true`.
+    #[doc(hidden)]
+    #[deprecated = "Use an if statement."]
     pub fn if_true<F>(self, value: bool, f: F) -> Self
     where
         F: FnOnce(ClientRequest) -> ClientRequest,
@@ -364,8 +327,9 @@ impl ClientRequest {
         }
     }
 
-    /// This method calls provided closure with builder reference if
-    /// value is `Some`.
+    /// This method calls provided closure with builder reference if value is `Some`.
+    #[doc(hidden)]
+    #[deprecated = "Use an if-let construction."]
     pub fn if_some<T, F>(self, value: Option<T>, f: F) -> Self
     where
         F: FnOnce(T, ClientRequest) -> ClientRequest,
@@ -518,7 +482,7 @@ impl ClientRequest {
             return Err(InvalidUrl::MissingScheme.into());
         } else if let Some(scheme) = uri.scheme() {
             match scheme.as_str() {
-                "http" | "ws" | "https" | "wss" => (),
+                "http" | "ws" | "https" | "wss" => {}
                 _ => return Err(InvalidUrl::UnknownScheme.into()),
             }
         } else {
@@ -527,16 +491,18 @@ impl ClientRequest {
 
         // set cookies
         if let Some(ref mut jar) = self.cookies {
-            let mut cookie = String::new();
-            for c in jar.delta() {
-                let name = percent_encode(c.name().as_bytes(), USERINFO);
-                let value = percent_encode(c.value().as_bytes(), USERINFO);
-                let _ = write!(&mut cookie, "; {}={}", name, value);
+            let cookie: String = jar
+                .delta()
+                // ensure only name=value is written to cookie header
+                .map(|c| Cookie::new(c.name(), c.value()).encoded().to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+
+            if !cookie.is_empty() {
+                self.head
+                    .headers
+                    .insert(header::COOKIE, HeaderValue::from_str(&cookie).unwrap());
             }
-            self.head.headers.insert(
-                header::COOKIE,
-                HeaderValue::from_str(&cookie.as_str()[2..]).unwrap(),
-            );
         }
 
         let mut slf = self;
@@ -550,12 +516,15 @@ impl ClientRequest {
                 .unwrap_or(true);
 
             if https {
-                slf = slf.set_header_if_none(header::ACCEPT_ENCODING, HTTPS_ENCODING)
+                slf =
+                    slf.insert_header_if_none((header::ACCEPT_ENCODING, HTTPS_ENCODING))
             } else {
                 #[cfg(any(feature = "flate2-zlib", feature = "flate2-rust"))]
                 {
-                    slf =
-                        slf.set_header_if_none(header::ACCEPT_ENCODING, "gzip, deflate")
+                    slf = slf.insert_header_if_none((
+                        header::ACCEPT_ENCODING,
+                        "gzip, deflate",
+                    ))
                 }
             };
         }
@@ -586,30 +555,37 @@ mod tests {
     use super::*;
     use crate::Client;
 
-    #[test]
-    fn test_debug() {
-        let request = Client::new().get("/").header("x-test", "111");
+    #[actix_rt::test]
+    async fn test_debug() {
+        let request = Client::new().get("/").append_header(("x-test", "111"));
         let repr = format!("{:?}", request);
         assert!(repr.contains("ClientRequest"));
         assert!(repr.contains("x-test"));
     }
 
-    #[test]
-    fn test_basics() {
-        let mut req = Client::new()
+    #[actix_rt::test]
+    async fn test_basics() {
+        let req = Client::new()
             .put("/")
             .version(Version::HTTP_2)
-            .set(header::Date(SystemTime::now().into()))
+            .insert_header(header::Date(SystemTime::now().into()))
             .content_type("plain/text")
-            .if_true(true, |req| req.header(header::SERVER, "awc"))
-            .if_true(false, |req| req.header(header::EXPECT, "awc"))
-            .if_some(Some("server"), |val, req| {
-                req.header(header::USER_AGENT, val)
-            })
-            .if_some(Option::<&str>::None, |_, req| {
-                req.header(header::ALLOW, "1")
-            })
-            .content_length(100);
+            .append_header((header::SERVER, "awc"));
+
+        let req = if let Some(val) = Some("server") {
+            req.append_header((header::USER_AGENT, val))
+        } else {
+            req
+        };
+
+        let req = if let Some(_val) = Option::<&str>::None {
+            req.append_header((header::ALLOW, "1"))
+        } else {
+            req
+        };
+
+        let mut req = req.content_length(100);
+
         assert!(req.headers().contains_key(header::CONTENT_TYPE));
         assert!(req.headers().contains_key(header::DATE));
         assert!(req.headers().contains_key(header::SERVER));
@@ -617,13 +593,14 @@ mod tests {
         assert!(!req.headers().contains_key(header::ALLOW));
         assert!(!req.headers().contains_key(header::EXPECT));
         assert_eq!(req.head.version, Version::HTTP_2);
+
         let _ = req.headers_mut();
         let _ = req.send_body("");
     }
 
-    #[test]
-    fn test_client_header() {
-        let req = Client::build()
+    #[actix_rt::test]
+    async fn test_client_header() {
+        let req = Client::builder()
             .header(header::CONTENT_TYPE, "111")
             .finish()
             .get("/");
@@ -639,13 +616,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_client_header_override() {
-        let req = Client::build()
+    #[actix_rt::test]
+    async fn test_client_header_override() {
+        let req = Client::builder()
             .header(header::CONTENT_TYPE, "111")
             .finish()
             .get("/")
-            .set_header(header::CONTENT_TYPE, "222");
+            .insert_header((header::CONTENT_TYPE, "222"));
 
         assert_eq!(
             req.head
@@ -658,8 +635,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn client_basic_auth() {
+    #[actix_rt::test]
+    async fn client_basic_auth() {
         let req = Client::new()
             .get("/")
             .basic_auth("username", Some("password"));
@@ -685,8 +662,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn client_bearer_auth() {
+    #[actix_rt::test]
+    async fn client_bearer_auth() {
         let req = Client::new().get("/").bearer_auth("someS3cr3tAutht0k3n");
         assert_eq!(
             req.head
@@ -699,8 +676,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn client_query() {
+    #[actix_rt::test]
+    async fn client_query() {
         let req = Client::new()
             .get("/")
             .query(&[("key1", "val1"), ("key2", "val2")])

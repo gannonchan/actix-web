@@ -4,14 +4,14 @@ use actix_codec::Framed;
 use actix_http::{body::BodySize, h1, ws, Error, HttpService, Request, Response};
 use actix_http_test::test_server;
 use bytes::Bytes;
-use futures::future::ok;
-use futures::{SinkExt, StreamExt};
+use futures_util::future::ok;
+use futures_util::{SinkExt, StreamExt};
 
 async fn ws_service(req: ws::Frame) -> Result<ws::Message, io::Error> {
     match req {
         ws::Frame::Ping(msg) => Ok(ws::Message::Pong(msg)),
         ws::Frame::Text(text) => Ok(ws::Message::Text(
-            String::from_utf8(Vec::from(text.as_ref())).unwrap(),
+            String::from_utf8(Vec::from(text.as_ref())).unwrap().into(),
         )),
         ws::Frame::Binary(bin) => Ok(ws::Message::Binary(bin)),
         ws::Frame::Close(reason) => Ok(ws::Message::Close(reason)),
@@ -32,20 +32,18 @@ async fn test_simple() {
                         .await?;
 
                     // start websocket service
-                    let framed = framed.into_framed(ws::Codec::new());
+                    let framed = framed.replace_codec(ws::Codec::new());
                     ws::Dispatcher::with(framed, ws_service).await
                 }
             })
             .finish(|_| ok::<_, Error>(Response::NotFound()))
             .tcp()
-    });
+    })
+    .await;
 
     // client service
     let mut framed = srv.ws().await.unwrap();
-    framed
-        .send(ws::Message::Text("text".to_string()))
-        .await
-        .unwrap();
+    framed.send(ws::Message::Text("text".into())).await.unwrap();
     let item = framed.next().await.unwrap().unwrap();
     assert_eq!(item, ws::Frame::Text(Bytes::from_static(b"text")));
 

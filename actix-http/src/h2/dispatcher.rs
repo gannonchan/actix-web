@@ -1,63 +1,66 @@
-use std::convert::TryFrom;
+use std::cell::RefCell;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::net;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll};
+use std::{cmp, convert::TryFrom};
 
 use actix_codec::{AsyncRead, AsyncWrite};
-use actix_rt::time::{Delay, Instant};
+use actix_rt::time::{Instant, Sleep};
 use actix_service::Service;
 use bytes::{Bytes, BytesMut};
+use futures_core::ready;
 use h2::server::{Connection, SendResponse};
 use h2::SendStream;
 use http::header::{HeaderValue, CONNECTION, CONTENT_LENGTH, DATE, TRANSFER_ENCODING};
 use log::{error, trace};
 
 use crate::body::{BodySize, MessageBody, ResponseBody};
-use crate::cloneable::CloneableService;
 use crate::config::ServiceConfig;
 use crate::error::{DispatchError, Error};
-use crate::helpers::DataFactory;
-use crate::httpmessage::HttpMessage;
 use crate::message::ResponseHead;
 use crate::payload::Payload;
 use crate::request::Request;
 use crate::response::Response;
+use crate::service::HttpFlow;
+use crate::OnConnectData;
 
 const CHUNK_SIZE: usize = 16_384;
 
-/// Dispatcher for HTTP/2 protocol
+/// Dispatcher for HTTP/2 protocol.
 #[pin_project::pin_project]
-pub struct Dispatcher<T, S: Service<Request = Request>, B: MessageBody>
+pub struct Dispatcher<T, S, B, X, U>
 where
     T: AsyncRead + AsyncWrite + Unpin,
+    S: Service<Request>,
+    B: MessageBody,
 {
-    service: CloneableService<S>,
+    flow: Rc<RefCell<HttpFlow<S, X, U>>>,
     connection: Connection<T, Bytes>,
-    on_connect: Option<Box<dyn DataFactory>>,
+    on_connect_data: OnConnectData,
     config: ServiceConfig,
     peer_addr: Option<net::SocketAddr>,
     ka_expire: Instant,
-    ka_timer: Option<Delay>,
-    _t: PhantomData<B>,
+    ka_timer: Option<Sleep>,
+    _phantom: PhantomData<B>,
 }
 
-impl<T, S, B> Dispatcher<T, S, B>
+impl<T, S, B, X, U> Dispatcher<T, S, B, X, U>
 where
     T: AsyncRead + AsyncWrite + Unpin,
-    S: Service<Request = Request>,
+    S: Service<Request>,
     S::Error: Into<Error>,
-    // S::Future: 'static,
     S::Response: Into<Response<B>>,
     B: MessageBody,
 {
     pub(crate) fn new(
-        service: CloneableService<S>,
+        services: Rc<RefCell<HttpFlow<S, X, U>>>,
         connection: Connection<T, Bytes>,
-        on_connect: Option<Box<dyn DataFactory>>,
+        on_connect_data: OnConnectData,
         config: ServiceConfig,
-        timeout: Option<Delay>,
+        timeout: Option<Sleep>,
         peer_addr: Option<net::SocketAddr>,
     ) -> Self {
         // let keepalive = config.keep_alive_enabled();
@@ -77,22 +80,22 @@ where
         };
 
         Dispatcher {
-            service,
+            flow: services,
             config,
             peer_addr,
             connection,
-            on_connect,
+            on_connect_data,
             ka_expire,
             ka_timer,
-            _t: PhantomData,
+            _phantom: PhantomData,
         }
     }
 }
 
-impl<T, S, B> Future for Dispatcher<T, S, B>
+impl<T, S, B, X, U> Future for Dispatcher<T, S, B, X, U>
 where
     T: AsyncRead + AsyncWrite + Unpin,
-    S: Service<Request = Request>,
+    S: Service<Request>,
     S::Error: Into<Error> + 'static,
     S::Future: 'static,
     S::Response: Into<Response<B>> + 'static,
@@ -105,10 +108,12 @@ where
         let this = self.get_mut();
 
         loop {
-            match Pin::new(&mut this.connection).poll_accept(cx) {
-                Poll::Ready(None) => return Poll::Ready(Ok(())),
-                Poll::Ready(Some(Err(err))) => return Poll::Ready(Err(err.into())),
-                Poll::Ready(Some(Ok((req, res)))) => {
+            match ready!(Pin::new(&mut this.connection).poll_accept(cx)) {
+                None => return Poll::Ready(Ok(())),
+
+                Some(Err(err)) => return Poll::Ready(Err(err.into())),
+
+                Some(Ok((req, res))) => {
                     // update keep-alive expire
                     if this.ka_timer.is_some() {
                         if let Some(expire) = this.config.keep_alive_expire() {
@@ -117,11 +122,9 @@ where
                     }
 
                     let (parts, body) = req.into_parts();
-                    let mut req = Request::with_payload(Payload::<
-                        crate::payload::PayloadStream,
-                    >::H2(
-                        crate::h2::Payload::new(body)
-                    ));
+                    let pl = crate::h2::Payload::new(body);
+                    let pl = Payload::<crate::payload::PayloadStream>::H2(pl);
+                    let mut req = Request::with_payload(pl);
 
                     let head = &mut req.head_mut();
                     head.uri = parts.uri;
@@ -130,27 +133,21 @@ where
                     head.headers = parts.headers.into();
                     head.peer_addr = this.peer_addr;
 
-                    // set on_connect data
-                    if let Some(ref on_connect) = this.on_connect {
-                        on_connect.set(&mut req.extensions_mut());
-                    }
+                    // merge on_connect_ext data into request extensions
+                    this.on_connect_data.merge_into(&mut req);
 
-                    actix_rt::spawn(ServiceResponse::<
-                        S::Future,
-                        S::Response,
-                        S::Error,
-                        B,
-                    > {
+                    let svc = ServiceResponse::<S::Future, S::Response, S::Error, B> {
                         state: ServiceResponseState::ServiceCall(
-                            this.service.call(req),
+                            this.flow.borrow_mut().service.call(req),
                             Some(res),
                         ),
                         config: this.config.clone(),
                         buffer: None,
-                        _t: PhantomData,
-                    });
+                        _phantom: PhantomData,
+                    };
+
+                    actix_rt::spawn(svc);
                 }
-                Poll::Pending => return Poll::Pending,
             }
         }
     }
@@ -158,15 +155,17 @@ where
 
 #[pin_project::pin_project]
 struct ServiceResponse<F, I, E, B> {
+    #[pin]
     state: ServiceResponseState<F, B>,
     config: ServiceConfig,
     buffer: Option<Bytes>,
-    _t: PhantomData<(I, E)>,
+    _phantom: PhantomData<(I, E)>,
 }
 
+#[pin_project::pin_project(project = ServiceResponseStateProj)]
 enum ServiceResponseState<F, B> {
-    ServiceCall(F, Option<SendResponse<Bytes>>),
-    SendPayload(SendStream<Bytes>, ResponseBody<B>),
+    ServiceCall(#[pin] F, Option<SendResponse<Bytes>>),
+    SendPayload(SendStream<Bytes>, #[pin] ResponseBody<B>),
 }
 
 impl<F, I, E, B> ServiceResponse<F, I, E, B>
@@ -197,8 +196,9 @@ where
                 skip_len = true;
                 *size = BodySize::Stream;
             }
-            _ => (),
+            _ => {}
         }
+
         let _ = match size {
             BodySize::None | BodySize::Stream => None,
             BodySize::Empty => res
@@ -208,20 +208,18 @@ where
                 CONTENT_LENGTH,
                 HeaderValue::try_from(format!("{}", len)).unwrap(),
             ),
-            BodySize::Sized64(len) => res.headers_mut().insert(
-                CONTENT_LENGTH,
-                HeaderValue::try_from(format!("{}", len)).unwrap(),
-            ),
         };
 
         // copy headers
         for (key, value) in head.headers.iter() {
             match *key {
-                CONNECTION | TRANSFER_ENCODING => continue, // http2 specific
+                // omit HTTP/1 only headers
+                CONNECTION | TRANSFER_ENCODING => continue,
                 CONTENT_LENGTH if skip_len => continue,
                 DATE => has_date = true,
-                _ => (),
+                _ => {}
             }
+
             res.headers_mut().append(key, value.clone());
         }
 
@@ -229,9 +227,11 @@ where
         if !has_date {
             let mut bytes = BytesMut::with_capacity(29);
             self.config.set_date_header(&mut bytes);
-            res.headers_mut().insert(DATE, unsafe {
-                HeaderValue::from_maybe_shared_unchecked(bytes.freeze())
-            });
+            res.headers_mut().insert(
+                DATE,
+                // SAFETY: serialized date-times are known ASCII strings
+                unsafe { HeaderValue::from_maybe_shared_unchecked(bytes.freeze()) },
+            );
         }
 
         res
@@ -250,10 +250,10 @@ where
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.as_mut().project();
 
-        match this.state {
-            ServiceResponseState::ServiceCall(ref mut call, ref mut send) => {
-                match unsafe { Pin::new_unchecked(call) }.poll(cx) {
-                    Poll::Ready(Ok(res)) => {
+        match this.state.project() {
+            ServiceResponseStateProj::ServiceCall(call, send) => {
+                match ready!(call.poll(cx)) {
+                    Ok(res) => {
                         let (res, body) = res.into().replace_body(());
 
                         let mut send = send.take().unwrap();
@@ -264,7 +264,7 @@ where
 
                         let stream = match send.send_response(h2_res, size.is_eof()) {
                             Err(e) => {
-                                trace!("Error sending h2 response: {:?}", e);
+                                trace!("Error sending HTTP/2 response: {:?}", e);
                                 return Poll::Ready(());
                             }
                             Ok(stream) => stream,
@@ -273,13 +273,13 @@ where
                         if size.is_eof() {
                             Poll::Ready(())
                         } else {
-                            *this.state =
-                                ServiceResponseState::SendPayload(stream, body);
+                            this.state
+                                .set(ServiceResponseState::SendPayload(stream, body));
                             self.poll(cx)
                         }
                     }
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(Err(e)) => {
+
+                    Err(e) => {
                         let res: Response = e.into().into();
                         let (res, body) = res.replace_body(());
 
@@ -291,7 +291,7 @@ where
 
                         let stream = match send.send_response(h2_res, size.is_eof()) {
                             Err(e) => {
-                                trace!("Error sending h2 response: {:?}", e);
+                                trace!("Error sending HTTP/2 response: {:?}", e);
                                 return Poll::Ready(());
                             }
                             Ok(stream) => stream,
@@ -300,64 +300,72 @@ where
                         if size.is_eof() {
                             Poll::Ready(())
                         } else {
-                            *this.state = ServiceResponseState::SendPayload(
+                            this.state.set(ServiceResponseState::SendPayload(
                                 stream,
                                 body.into_body(),
-                            );
+                            ));
                             self.poll(cx)
                         }
                     }
                 }
             }
-            ServiceResponseState::SendPayload(ref mut stream, ref mut body) => loop {
-                loop {
-                    if let Some(ref mut buffer) = this.buffer {
-                        match stream.poll_capacity(cx) {
-                            Poll::Pending => return Poll::Pending,
-                            Poll::Ready(None) => return Poll::Ready(()),
-                            Poll::Ready(Some(Ok(cap))) => {
-                                let len = buffer.len();
-                                let bytes = buffer.split_to(std::cmp::min(cap, len));
 
-                                if let Err(e) = stream.send_data(bytes, false) {
-                                    warn!("{:?}", e);
+            ServiceResponseStateProj::SendPayload(ref mut stream, ref mut body) => {
+                loop {
+                    loop {
+                        match this.buffer {
+                            Some(ref mut buffer) => {
+                                match ready!(stream.poll_capacity(cx)) {
+                                    None => return Poll::Ready(()),
+
+                                    Some(Ok(cap)) => {
+                                        let len = buffer.len();
+                                        let bytes = buffer.split_to(cmp::min(cap, len));
+
+                                        if let Err(e) = stream.send_data(bytes, false) {
+                                            warn!("{:?}", e);
+                                            return Poll::Ready(());
+                                        } else if !buffer.is_empty() {
+                                            let cap = cmp::min(buffer.len(), CHUNK_SIZE);
+                                            stream.reserve_capacity(cap);
+                                        } else {
+                                            this.buffer.take();
+                                        }
+                                    }
+
+                                    Some(Err(e)) => {
+                                        warn!("{:?}", e);
+                                        return Poll::Ready(());
+                                    }
+                                }
+                            }
+
+                            None => match ready!(body.as_mut().poll_next(cx)) {
+                                None => {
+                                    if let Err(e) = stream.send_data(Bytes::new(), true)
+                                    {
+                                        warn!("{:?}", e);
+                                    }
                                     return Poll::Ready(());
-                                } else if !buffer.is_empty() {
-                                    let cap = std::cmp::min(buffer.len(), CHUNK_SIZE);
-                                    stream.reserve_capacity(cap);
-                                } else {
-                                    this.buffer.take();
                                 }
-                            }
-                            Poll::Ready(Some(Err(e))) => {
-                                warn!("{:?}", e);
-                                return Poll::Ready(());
-                            }
-                        }
-                    } else {
-                        match body.poll_next(cx) {
-                            Poll::Pending => return Poll::Pending,
-                            Poll::Ready(None) => {
-                                if let Err(e) = stream.send_data(Bytes::new(), true) {
-                                    warn!("{:?}", e);
+
+                                Some(Ok(chunk)) => {
+                                    stream.reserve_capacity(cmp::min(
+                                        chunk.len(),
+                                        CHUNK_SIZE,
+                                    ));
+                                    *this.buffer = Some(chunk);
                                 }
-                                return Poll::Ready(());
-                            }
-                            Poll::Ready(Some(Ok(chunk))) => {
-                                stream.reserve_capacity(std::cmp::min(
-                                    chunk.len(),
-                                    CHUNK_SIZE,
-                                ));
-                                *this.buffer = Some(chunk);
-                            }
-                            Poll::Ready(Some(Err(e))) => {
-                                error!("Response payload stream error: {:?}", e);
-                                return Poll::Ready(());
-                            }
+
+                                Some(Err(e)) => {
+                                    error!("Response payload stream error: {:?}", e);
+                                    return Poll::Ready(());
+                                }
+                            },
                         }
                     }
                 }
-            },
+            }
         }
     }
 }

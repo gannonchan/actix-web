@@ -1,15 +1,15 @@
+use std::future::Future;
 use std::net;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use actix_rt::time::{delay_for, Delay};
+use actix_rt::time::{sleep, Sleep};
 use bytes::Bytes;
 use derive_more::From;
-use futures_core::{Future, Stream};
+use futures_core::Stream;
 use serde::Serialize;
-use serde_json;
 
 use actix_http::body::{Body, BodyStream};
 use actix_http::http::header::{self, IntoHeaderValue};
@@ -33,18 +33,18 @@ pub(crate) enum PrepForSendingError {
     Http(HttpError),
 }
 
-impl Into<FreezeRequestError> for PrepForSendingError {
-    fn into(self) -> FreezeRequestError {
-        match self {
+impl From<PrepForSendingError> for FreezeRequestError {
+    fn from(err: PrepForSendingError) -> FreezeRequestError {
+        match err {
             PrepForSendingError::Url(e) => FreezeRequestError::Url(e),
             PrepForSendingError::Http(e) => FreezeRequestError::Http(e),
         }
     }
 }
 
-impl Into<SendRequestError> for PrepForSendingError {
-    fn into(self) -> SendRequestError {
-        match self {
+impl From<PrepForSendingError> for SendRequestError {
+    fn from(err: PrepForSendingError) -> SendRequestError {
+        match err {
             PrepForSendingError::Url(e) => SendRequestError::Url(e),
             PrepForSendingError::Http(e) => SendRequestError::Http(e),
         }
@@ -56,7 +56,8 @@ impl Into<SendRequestError> for PrepForSendingError {
 pub enum SendClientRequest {
     Fut(
         Pin<Box<dyn Future<Output = Result<ClientResponse, SendRequestError>>>>,
-        Option<Delay>,
+        // FIXME: use a pinned Sleep instead of box.
+        Option<Pin<Box<Sleep>>>,
         bool,
     ),
     Err(Option<SendRequestError>),
@@ -68,7 +69,7 @@ impl SendClientRequest {
         response_decompress: bool,
         timeout: Option<Duration>,
     ) -> SendClientRequest {
-        let delay = timeout.map(delay_for);
+        let delay = timeout.map(|d| Box::pin(sleep(d)));
         SendClientRequest::Fut(send, delay, response_decompress)
     }
 }
@@ -85,7 +86,7 @@ impl Future for SendClientRequest {
             SendClientRequest::Fut(send, delay, response_decompress) => {
                 if delay.is_some() {
                     match Pin::new(delay.as_mut().unwrap()).poll(cx) {
-                        Poll::Pending => (),
+                        Poll::Pending => {}
                         _ => return Poll::Ready(Err(SendRequestError::Timeout)),
                     }
                 }
@@ -126,7 +127,7 @@ impl Future for SendClientRequest {
             SendClientRequest::Fut(send, delay, _) => {
                 if delay.is_some() {
                     match Pin::new(delay.as_mut().unwrap()).poll(cx) {
-                        Poll::Pending => (),
+                        Poll::Pending => {}
                         _ => return Poll::Ready(Err(SendRequestError::Timeout)),
                     }
                 }
@@ -193,11 +194,7 @@ impl RequestSender {
             }
         };
 
-        SendClientRequest::new(
-            fut,
-            response_decompress,
-            timeout.or_else(|| config.timeout),
-        )
+        SendClientRequest::new(fut, response_decompress, timeout.or(config.timeout))
     }
 
     pub(crate) fn send_json<T: Serialize>(
@@ -299,7 +296,7 @@ impl RequestSender {
         match self {
             RequestSender::Owned(head) => {
                 if !head.headers.contains_key(&key) {
-                    match value.try_into() {
+                    match value.try_into_value() {
                         Ok(value) => head.headers.insert(key, value),
                         Err(e) => return Err(e.into()),
                     }
@@ -309,7 +306,7 @@ impl RequestSender {
                 if !head.headers.contains_key(&key)
                     && !extra_headers.iter().any(|h| h.contains_key(&key))
                 {
-                    match value.try_into() {
+                    match value.try_into_value() {
                         Ok(v) => {
                             let h = extra_headers.get_or_insert(HeaderMap::new());
                             h.insert(key, v)

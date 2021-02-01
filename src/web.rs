@@ -1,15 +1,14 @@
 //! Essentials helper functions and types for application registration.
 use actix_http::http::Method;
 use actix_router::IntoPattern;
-use futures::Future;
+use std::future::Future;
 
 pub use actix_http::Response as HttpResponse;
-pub use bytes::{Bytes, BytesMut};
-pub use futures::channel::oneshot::Canceled;
+pub use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::error::BlockingError;
 use crate::extract::FromRequest;
-use crate::handler::Factory;
+use crate::handler::Handler;
 use crate::resource::Resource;
 use crate::responder::Responder;
 use crate::route::Route;
@@ -19,6 +18,7 @@ use crate::service::WebService;
 pub use crate::config::ServiceConfig;
 pub use crate::data::Data;
 pub use crate::request::HttpRequest;
+pub use crate::request_data::ReqData;
 pub use crate::types::*;
 
 /// Create resource for a specific path.
@@ -96,7 +96,7 @@ pub fn route() -> Route {
 /// );
 /// ```
 ///
-/// In the above example, one `GET` route get added:
+/// In the above example, one `GET` route gets added:
 ///  * /{project_id}
 ///
 pub fn get() -> Route {
@@ -114,7 +114,7 @@ pub fn get() -> Route {
 /// );
 /// ```
 ///
-/// In the above example, one `POST` route get added:
+/// In the above example, one `POST` route gets added:
 ///  * /{project_id}
 ///
 pub fn post() -> Route {
@@ -132,7 +132,7 @@ pub fn post() -> Route {
 /// );
 /// ```
 ///
-/// In the above example, one `PUT` route get added:
+/// In the above example, one `PUT` route gets added:
 ///  * /{project_id}
 ///
 pub fn put() -> Route {
@@ -150,7 +150,7 @@ pub fn put() -> Route {
 /// );
 /// ```
 ///
-/// In the above example, one `PATCH` route get added:
+/// In the above example, one `PATCH` route gets added:
 ///  * /{project_id}
 ///
 pub fn patch() -> Route {
@@ -168,7 +168,7 @@ pub fn patch() -> Route {
 /// );
 /// ```
 ///
-/// In the above example, one `DELETE` route get added:
+/// In the above example, one `DELETE` route gets added:
 ///  * /{project_id}
 ///
 pub fn delete() -> Route {
@@ -186,11 +186,29 @@ pub fn delete() -> Route {
 /// );
 /// ```
 ///
-/// In the above example, one `HEAD` route get added:
+/// In the above example, one `HEAD` route gets added:
 ///  * /{project_id}
 ///
 pub fn head() -> Route {
     method(Method::HEAD)
+}
+
+/// Create *route* with `TRACE` method guard.
+///
+/// ```rust
+/// use actix_web::{web, App, HttpResponse};
+///
+/// let app = App::new().service(
+///     web::resource("/{project_id}")
+///         .route(web::trace().to(|| HttpResponse::Ok()))
+/// );
+/// ```
+///
+/// In the above example, one `HEAD` route gets added:
+///  * /{project_id}
+///
+pub fn trace() -> Route {
+    method(Method::TRACE)
 }
 
 /// Create *route* and add method guard.
@@ -204,7 +222,7 @@ pub fn head() -> Route {
 /// );
 /// ```
 ///
-/// In the above example, one `GET` route get added:
+/// In the above example, one `GET` route gets added:
 ///  * /{project_id}
 ///
 pub fn method(method: Method) -> Route {
@@ -225,12 +243,12 @@ pub fn method(method: Method) -> Route {
 ///         web::to(index))
 /// );
 /// ```
-pub fn to<F, I, R, U>(handler: F) -> Route
+pub fn to<F, I, R>(handler: F) -> Route
 where
-    F: Factory<I, R, U>,
+    F: Handler<I, R>,
     I: FromRequest + 'static,
-    R: Future<Output = U> + 'static,
-    U: Responder + 'static,
+    R: Future + 'static,
+    R::Output: Responder + 'static,
 {
     Route::new().to(handler)
 }
@@ -262,5 +280,8 @@ where
     I: Send + 'static,
     E: Send + std::fmt::Debug + 'static,
 {
-    actix_threadpool::run(f).await
+    match actix_rt::task::spawn_blocking(f).await {
+        Ok(res) => res.map_err(BlockingError::Error),
+        Err(_) => Err(BlockingError::Canceled),
+    }
 }

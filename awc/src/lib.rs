@@ -1,28 +1,98 @@
-#![deny(rust_2018_idioms, warnings)]
+//! `awc` is a HTTP and WebSocket client library built on the Actix ecosystem.
+//!
+//! ## Making a GET request
+//!
+//! ```no_run
+//! # #[actix_rt::main]
+//! # async fn main() -> Result<(), awc::error::SendRequestError> {
+//! let mut client = awc::Client::default();
+//! let response = client.get("http://www.rust-lang.org") // <- Create request builder
+//!     .insert_header(("User-Agent", "Actix-web"))
+//!     .send()                                            // <- Send http request
+//!     .await?;
+//!
+//!  println!("Response: {:?}", response);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Making POST requests
+//!
+//! ### Raw body contents
+//!
+//! ```no_run
+//! # #[actix_rt::main]
+//! # async fn main() -> Result<(), awc::error::SendRequestError> {
+//! let mut client = awc::Client::default();
+//! let response = client.post("http://httpbin.org/post")
+//!     .send_body("Raw body contents")
+//!     .await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ### Forms
+//!
+//! ```no_run
+//! # #[actix_rt::main]
+//! # async fn main() -> Result<(), awc::error::SendRequestError> {
+//! let params = [("foo", "bar"), ("baz", "quux")];
+//!
+//! let mut client = awc::Client::default();
+//! let response = client.post("http://httpbin.org/post")
+//!     .send_form(&params)
+//!     .await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ### JSON
+//!
+//! ```no_run
+//! # #[actix_rt::main]
+//! # async fn main() -> Result<(), awc::error::SendRequestError> {
+//! let request = serde_json::json!({
+//!     "lang": "rust",
+//!     "body": "json"
+//! });
+//!
+//! let mut client = awc::Client::default();
+//! let response = client.post("http://httpbin.org/post")
+//!     .send_json(&request)
+//!     .await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## WebSocket support
+//!
+//! ```no_run
+//! # #[actix_rt::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use futures_util::{sink::SinkExt, stream::StreamExt};
+//! let (_resp, mut connection) = awc::Client::new()
+//!     .ws("ws://echo.websocket.org")
+//!     .connect()
+//!     .await?;
+//!
+//! connection
+//!     .send(awc::ws::Message::Text("Echo".into()))
+//!     .await?;
+//! let response = connection.next().await.unwrap()?;
+//! # assert_eq!(response, awc::ws::Frame::Text("Echo".as_bytes().into()));
+//! # Ok(())
+//! # }
+//! ```
+
+#![deny(rust_2018_idioms)]
 #![allow(
     clippy::type_complexity,
     clippy::borrow_interior_mutable_const,
     clippy::needless_doctest_main
 )]
-//! An HTTP Client
-//!
-//! ```rust
-//! use futures::future::{lazy, Future};
-//! use actix_rt::System;
-//! use awc::Client;
-//!
-//! #[actix_rt::main]
-//! async fn main() {
-//!    let mut client = Client::default();
-//!
-//!    let response = client.get("http://www.rust-lang.org") // <- Create request builder
-//!        .header("User-Agent", "Actix-web")
-//!        .send()                             // <- Send http request
-//!        .await;
-//!
-//!     println!("Response: {:?}", response);
-//! }
-//! ```
+#![doc(html_logo_url = "https://actix.rs/img/logo.png")]
+#![doc(html_favicon_url = "https://actix.rs/favicon.ico")]
+
 use std::cell::RefCell;
 use std::convert::TryFrom;
 use std::rc::Rc;
@@ -52,7 +122,9 @@ pub use self::sender::SendClientRequest;
 
 use self::connect::{Connect, ConnectorWrapper};
 
-/// An HTTP Client
+/// An asynchronous HTTP and WebSocket client.
+///
+/// ## Examples
 ///
 /// ```rust
 /// use awc::Client;
@@ -62,7 +134,7 @@ use self::connect::{Connect, ConnectorWrapper};
 ///     let mut client = Client::default();
 ///
 ///     let res = client.get("http://www.rust-lang.org") // <- Create request builder
-///         .header("User-Agent", "Actix-web")
+///         .insert_header(("User-Agent", "Actix-web"))
 ///         .send()                             // <- Send http request
 ///         .await;                             // <- send request and wait for response
 ///
@@ -96,8 +168,9 @@ impl Client {
         Client::default()
     }
 
-    /// Build client instance.
-    pub fn build() -> ClientBuilder {
+    /// Create `Client` builder.
+    /// This function is equivalent of `ClientBuilder::new()`.
+    pub fn builder() -> ClientBuilder {
         ClientBuilder::new()
     }
 
@@ -109,8 +182,8 @@ impl Client {
     {
         let mut req = ClientRequest::new(method, url, self.0.clone());
 
-        for (key, value) in self.0.headers.iter() {
-            req = req.set_header_if_none(key.clone(), value.clone());
+        for header in self.0.headers.iter() {
+            req = req.insert_header_if_none(header);
         }
         req
     }
@@ -125,8 +198,8 @@ impl Client {
         <Uri as TryFrom<U>>::Error: Into<HttpError>,
     {
         let mut req = self.request(head.method.clone(), url);
-        for (key, value) in head.headers.iter() {
-            req = req.set_header_if_none(key.clone(), value.clone());
+        for header in head.headers.iter() {
+            req = req.insert_header_if_none(header);
         }
         req
     }
@@ -194,7 +267,8 @@ impl Client {
         self.request(Method::OPTIONS, url)
     }
 
-    /// Construct WebSockets request.
+    /// Initialize a WebSocket connection.
+    /// Returns a WebSocket connection builder.
     pub fn ws<U>(&self, url: U) -> ws::WebsocketsRequest
     where
         Uri: TryFrom<U>,

@@ -2,7 +2,7 @@ use std::{env, io};
 
 use actix_http::{HttpService, Response};
 use actix_server::Server;
-use futures::future;
+use futures_util::future;
 use http::header::HeaderValue;
 use log::info;
 
@@ -19,7 +19,10 @@ async fn main() -> io::Result<()> {
                 .finish(|_req| {
                     info!("{:?}", _req);
                     let mut res = Response::Ok();
-                    res.header("x-head", HeaderValue::from_static("dummy value!"));
+                    res.insert_header((
+                        "x-head",
+                        HeaderValue::from_static("dummy value!"),
+                    ));
                     future::ok::<_, ()>(res.body("Hello world!"))
                 })
                 .tcp()

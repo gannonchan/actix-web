@@ -6,20 +6,24 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use actix_codec::{AsyncRead, AsyncWrite};
-use actix_rt::time::{delay_for, Delay};
+use actix_codec::{AsyncRead, AsyncWrite, ReadBuf};
+use actix_rt::time::{sleep, Sleep};
 use actix_service::Service;
-use actix_utils::{oneshot, task::LocalWaker};
+use actix_utils::task::LocalWaker;
+use ahash::AHashMap;
 use bytes::Bytes;
+use futures_channel::oneshot;
 use futures_util::future::{poll_fn, FutureExt, LocalBoxFuture};
-use fxhash::FxHashMap;
-use h2::client::{handshake, Connection, SendRequest};
+use h2::client::{Connection, SendRequest};
 use http::uri::Authority;
 use indexmap::IndexSet;
+use pin_project::pin_project;
 use slab::Slab;
 
+use super::config::ConnectorConfig;
 use super::connection::{ConnectionType, IoConnection};
 use super::error::ConnectError;
+use super::h2proto::handshake;
 use super::Connect;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -46,30 +50,26 @@ pub(crate) struct ConnectionPool<T, Io: 'static>(Rc<RefCell<T>>, Rc<RefCell<Inne
 impl<T, Io> ConnectionPool<T, Io>
 where
     Io: AsyncRead + AsyncWrite + Unpin + 'static,
-    T: Service<Request = Connect, Response = (Io, Protocol), Error = ConnectError>
-        + 'static,
+    T: Service<Connect, Response = (Io, Protocol), Error = ConnectError> + 'static,
 {
-    pub(crate) fn new(
-        connector: T,
-        conn_lifetime: Duration,
-        conn_keep_alive: Duration,
-        disconnect_timeout: Option<Duration>,
-        limit: usize,
-    ) -> Self {
-        ConnectionPool(
-            Rc::new(RefCell::new(connector)),
-            Rc::new(RefCell::new(Inner {
-                conn_lifetime,
-                conn_keep_alive,
-                disconnect_timeout,
-                limit,
-                acquired: 0,
-                waiters: Slab::new(),
-                waiters_queue: IndexSet::new(),
-                available: FxHashMap::default(),
-                waker: LocalWaker::new(),
-            })),
-        )
+    pub(crate) fn new(connector: T, config: ConnectorConfig) -> Self {
+        let connector_rc = Rc::new(RefCell::new(connector));
+        let inner_rc = Rc::new(RefCell::new(Inner {
+            config,
+            acquired: 0,
+            waiters: Slab::new(),
+            waiters_queue: IndexSet::new(),
+            available: AHashMap::default(),
+            waker: LocalWaker::new(),
+        }));
+
+        // start support future
+        actix_rt::spawn(ConnectorPoolSupport {
+            connector: Rc::clone(&connector_rc),
+            inner: Rc::clone(&inner_rc),
+        });
+
+        ConnectionPool(connector_rc, inner_rc)
     }
 }
 
@@ -82,13 +82,18 @@ where
     }
 }
 
-impl<T, Io> Service for ConnectionPool<T, Io>
+impl<T, Io> Drop for ConnectionPool<T, Io> {
+    fn drop(&mut self) {
+        // wake up the ConnectorPoolSupport when dropping so it can exit properly.
+        self.1.borrow().waker.wake();
+    }
+}
+
+impl<T, Io> Service<Connect> for ConnectionPool<T, Io>
 where
     Io: AsyncRead + AsyncWrite + Unpin + 'static,
-    T: Service<Request = Connect, Response = (Io, Protocol), Error = ConnectError>
-        + 'static,
+    T: Service<Connect, Response = (Io, Protocol), Error = ConnectError> + 'static,
 {
-    type Request = Connect;
     type Response = IoConnection<Io>;
     type Error = ConnectError;
     type Future = LocalBoxFuture<'static, Result<IoConnection<Io>, ConnectError>>;
@@ -98,12 +103,6 @@ where
     }
 
     fn call(&mut self, req: Connect) -> Self::Future {
-        // start support future
-        actix_rt::spawn(ConnectorPoolSupport {
-            connector: self.0.clone(),
-            inner: self.1.clone(),
-        });
-
         let mut connector = self.0.clone();
         let inner = self.1.clone();
 
@@ -111,22 +110,24 @@ where
             let key = if let Some(authority) = req.uri.authority() {
                 authority.clone().into()
             } else {
-                return Err(ConnectError::Unresolverd);
+                return Err(ConnectError::Unresolved);
             };
 
             // acquire connection
             match poll_fn(|cx| Poll::Ready(inner.borrow_mut().acquire(&key, cx))).await {
                 Acquire::Acquired(io, created) => {
                     // use existing connection
-                    return Ok(IoConnection::new(
+                    Ok(IoConnection::new(
                         io,
                         created,
                         Some(Acquired(key, Some(inner))),
-                    ));
+                    ))
                 }
                 Acquire::Available => {
                     // open tcp connection
                     let (io, proto) = connector.call(req).await?;
+
+                    let config = inner.borrow().config.clone();
 
                     let guard = OpenGuard::new(key, inner);
 
@@ -137,7 +138,7 @@ where
                             Some(guard.consume()),
                         ))
                     } else {
-                        let (snd, connection) = handshake(io).await?;
+                        let (snd, connection) = handshake(io, &config).await?;
                         actix_rt::spawn(connection.map(|_| ()));
                         Ok(IoConnection::new(
                             ConnectionType::H2(snd),
@@ -199,7 +200,7 @@ where
         if let Some(i) = self.inner.take() {
             let mut inner = i.as_ref().borrow_mut();
             inner.release_waiter(&self.key, self.token);
-            inner.check_availibility();
+            inner.check_availability();
         }
     }
 }
@@ -236,7 +237,7 @@ where
         if let Some(i) = self.inner.take() {
             let mut inner = i.as_ref().borrow_mut();
             inner.release();
-            inner.check_availibility();
+            inner.check_availability();
         }
     }
 }
@@ -254,12 +255,9 @@ struct AvailableConnection<Io> {
 }
 
 pub(crate) struct Inner<Io> {
-    conn_lifetime: Duration,
-    conn_keep_alive: Duration,
-    disconnect_timeout: Option<Duration>,
-    limit: usize,
+    config: ConnectorConfig,
     acquired: usize,
-    available: FxHashMap<Key, VecDeque<AvailableConnection<Io>>>,
+    available: AHashMap<Key, VecDeque<AvailableConnection<Io>>>,
     waiters: Slab<
         Option<(
             Connect,
@@ -310,7 +308,7 @@ where
 
     fn acquire(&mut self, key: &Key, cx: &mut Context<'_>) -> Acquire<Io> {
         // check limits
-        if self.limit > 0 && self.acquired >= self.limit {
+        if self.config.limit > 0 && self.acquired >= self.config.limit {
             return Acquire::NotAvailable;
         }
 
@@ -322,10 +320,10 @@ where
             let now = Instant::now();
             while let Some(conn) = connections.pop_back() {
                 // check if it still usable
-                if (now - conn.used) > self.conn_keep_alive
-                    || (now - conn.created) > self.conn_lifetime
+                if (now - conn.used) > self.config.conn_keep_alive
+                    || (now - conn.created) > self.config.conn_lifetime
                 {
-                    if let Some(timeout) = self.disconnect_timeout {
+                    if let Some(timeout) = self.config.disconnect_timeout {
                         if let ConnectionType::H1(io) = conn.io {
                             actix_rt::spawn(CloseConnection::new(io, timeout))
                         }
@@ -333,11 +331,12 @@ where
                 } else {
                     let mut io = conn.io;
                     let mut buf = [0; 2];
+                    let mut read_buf = ReadBuf::new(&mut buf);
                     if let ConnectionType::H1(ref mut s) = io {
-                        match Pin::new(s).poll_read(cx, &mut buf) {
-                            Poll::Pending => (),
-                            Poll::Ready(Ok(n)) if n > 0 => {
-                                if let Some(timeout) = self.disconnect_timeout {
+                        match Pin::new(s).poll_read(cx, &mut read_buf) {
+                            Poll::Pending => {}
+                            Poll::Ready(Ok(())) if !read_buf.filled().is_empty() => {
+                                if let Some(timeout) = self.config.disconnect_timeout {
                                     if let ConnectionType::H1(io) = io {
                                         actix_rt::spawn(CloseConnection::new(
                                             io, timeout,
@@ -366,29 +365,31 @@ where
                 created,
                 used: Instant::now(),
             });
-        self.check_availibility();
+        self.check_availability();
     }
 
     fn release_close(&mut self, io: ConnectionType<Io>) {
         self.acquired -= 1;
-        if let Some(timeout) = self.disconnect_timeout {
+        if let Some(timeout) = self.config.disconnect_timeout {
             if let ConnectionType::H1(io) = io {
                 actix_rt::spawn(CloseConnection::new(io, timeout))
             }
         }
-        self.check_availibility();
+        self.check_availability();
     }
 
-    fn check_availibility(&self) {
-        if !self.waiters_queue.is_empty() && self.acquired < self.limit {
+    fn check_availability(&self) {
+        if !self.waiters_queue.is_empty() && self.acquired < self.config.limit {
             self.waker.wake();
         }
     }
 }
 
+#[pin_project::pin_project]
 struct CloseConnection<T> {
     io: T,
-    timeout: Delay,
+    #[pin]
+    timeout: Sleep,
 }
 
 impl<T> CloseConnection<T>
@@ -398,7 +399,7 @@ where
     fn new(io: T, timeout: Duration) -> Self {
         CloseConnection {
             io,
-            timeout: delay_for(timeout),
+            timeout: sleep(timeout),
         }
     }
 }
@@ -410,11 +411,11 @@ where
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let this = self.get_mut();
+        let this = self.project();
 
-        match Pin::new(&mut this.timeout).poll(cx) {
+        match this.timeout.poll(cx) {
             Poll::Ready(_) => Poll::Ready(()),
-            Poll::Pending => match Pin::new(&mut this.io).poll_shutdown(cx) {
+            Poll::Pending => match Pin::new(this.io).poll_shutdown(cx) {
                 Poll::Ready(_) => Poll::Ready(()),
                 Poll::Pending => Poll::Pending,
             },
@@ -422,6 +423,7 @@ where
     }
 }
 
+#[pin_project]
 struct ConnectorPoolSupport<T, Io>
 where
     Io: AsyncRead + AsyncWrite + Unpin + 'static,
@@ -433,15 +435,21 @@ where
 impl<T, Io> Future for ConnectorPoolSupport<T, Io>
 where
     Io: AsyncRead + AsyncWrite + Unpin + 'static,
-    T: Service<Request = Connect, Response = (Io, Protocol), Error = ConnectError>,
+    T: Service<Connect, Response = (Io, Protocol), Error = ConnectError>,
     T::Future: 'static,
 {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
+        let this = self.project();
 
-        let mut inner = this.inner.as_ref().borrow_mut();
+        if Rc::strong_count(this.inner) == 1 {
+            // If we are last copy of Inner<Io> it means the ConnectionPool is already gone
+            // and we are safe to exit.
+            return Poll::Ready(());
+        }
+
+        let mut inner = this.inner.borrow_mut();
         inner.waker.register(cx.waker());
 
         // check waiters
@@ -478,6 +486,7 @@ where
                         tx,
                         this.inner.clone(),
                         this.connector.call(connect),
+                        inner.config.clone(),
                     );
                 }
             }
@@ -488,10 +497,12 @@ where
     }
 }
 
+#[pin_project::pin_project(PinnedDrop)]
 struct OpenWaitingConnection<F, Io>
 where
     Io: AsyncRead + AsyncWrite + Unpin + 'static,
 {
+    #[pin]
     fut: F,
     key: Key,
     h2: Option<
@@ -502,6 +513,7 @@ where
     >,
     rx: Option<oneshot::Sender<Result<IoConnection<Io>, ConnectError>>>,
     inner: Option<Rc<RefCell<Inner<Io>>>>,
+    config: ConnectorConfig,
 }
 
 impl<F, Io> OpenWaitingConnection<F, Io>
@@ -514,6 +526,7 @@ where
         rx: oneshot::Sender<Result<IoConnection<Io>, ConnectError>>,
         inner: Rc<RefCell<Inner<Io>>>,
         fut: F,
+        config: ConnectorConfig,
     ) {
         actix_rt::spawn(OpenWaitingConnection {
             key,
@@ -521,19 +534,21 @@ where
             h2: None,
             rx: Some(rx),
             inner: Some(inner),
+            config,
         })
     }
 }
 
-impl<F, Io> Drop for OpenWaitingConnection<F, Io>
+#[pin_project::pinned_drop]
+impl<F, Io> PinnedDrop for OpenWaitingConnection<F, Io>
 where
     Io: AsyncRead + AsyncWrite + Unpin + 'static,
 {
-    fn drop(&mut self) {
-        if let Some(inner) = self.inner.take() {
+    fn drop(self: Pin<&mut Self>) {
+        if let Some(inner) = self.project().inner.take() {
             let mut inner = inner.as_ref().borrow_mut();
             inner.release();
-            inner.check_availibility();
+            inner.check_availability();
         }
     }
 }
@@ -545,8 +560,8 @@ where
 {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.as_mut().project();
 
         if let Some(ref mut h2) = this.h2 {
             return match Pin::new(h2).poll(cx) {
@@ -571,7 +586,7 @@ where
             };
         }
 
-        match unsafe { Pin::new_unchecked(&mut this.fut) }.poll(cx) {
+        match this.fut.poll(cx) {
             Poll::Ready(Err(err)) => {
                 let _ = this.inner.take();
                 if let Some(rx) = this.rx.take() {
@@ -589,8 +604,8 @@ where
                     )));
                     Poll::Ready(())
                 } else {
-                    this.h2 = Some(handshake(io).boxed_local());
-                    unsafe { Pin::new_unchecked(this) }.poll(cx)
+                    *this.h2 = Some(handshake(io, this.config).boxed_local());
+                    self.poll(cx)
                 }
             }
             Poll::Pending => Poll::Pending,

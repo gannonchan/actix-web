@@ -1,5 +1,35 @@
 # Changes
 
+## Unreleased - 2021-xx-xx
+
+
+## 4.0.0-beta.1 - 2021-01-07
+* Update `pin-project` to `1.0`.
+* Update `bytes` to `1.0`. [#1813]
+* `WebsocketContext::text` now takes an `Into<bytestring::ByteString>`. [#1864]
+
+[#1813]: https://github.com/actix/actix-web/pull/1813
+[#1864]: https://github.com/actix/actix-web/pull/1864
+
+
+## 3.0.0 - 2020-09-11
+* No significant changes from `3.0.0-beta.2`.
+
+
+## 3.0.0-beta.2 - 2020-09-10
+* Update `actix-*` dependencies to latest versions.
+
+
+## [3.0.0-beta.1] - 2020-xx-xx
+* Update `actix-web` & `actix-http` dependencies to beta.1
+* Bump minimum supported Rust version to 1.40
+
+
+## [3.0.0-alpha.1] - 2020-05-08
+* Update the actix-web dependency to 3.0.0-alpha.1
+* Update the actix dependency to 0.10.0-alpha.2
+* Update the actix-http dependency to 2.0.0-alpha.3
+
 ## [2.0.0] - 2019-12-20
 
 * Release

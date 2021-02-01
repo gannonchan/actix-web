@@ -1,80 +1,63 @@
-//! Path extractor
-use std::sync::Arc;
-use std::{fmt, ops};
+//! For path segment extractor documentation, see [`Path`].
+
+use std::{fmt, ops, sync::Arc};
 
 use actix_http::error::{Error, ErrorNotFound};
 use actix_router::PathDeserializer;
-use futures::future::{ready, Ready};
+use futures_util::future::{ready, Ready};
 use serde::de;
 
-use crate::dev::Payload;
-use crate::error::PathError;
-use crate::request::HttpRequest;
-use crate::FromRequest;
+use crate::{dev::Payload, error::PathError, FromRequest, HttpRequest};
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-/// Extract typed information from the request's path.
+/// Extract typed data from request path segments.
 ///
-/// [**PathConfig**](struct.PathConfig.html) allows to configure extraction process.
+/// Use [`PathConfig`] to configure extraction process.
 ///
-/// ## Example
+/// # Usage
+/// ```
+/// use actix_web::{get, web};
 ///
-/// ```rust
-/// use actix_web::{web, App};
-///
-/// /// extract path info from "/{username}/{count}/index.html" url
-/// /// {username} - deserializes to a String
-/// /// {count} -  - deserializes to a u32
-/// async fn index(info: web::Path<(String, u32)>) -> String {
-///     format!("Welcome {}! {}", info.0, info.1)
-/// }
-///
-/// fn main() {
-///     let app = App::new().service(
-///         web::resource("/{username}/{count}/index.html") // <- define path parameters
-///              .route(web::get().to(index))               // <- register handler with `Path` extractor
-///     );
+/// // extract path info from "/{name}/{count}/index.html" into tuple
+/// // {name}  - deserialize a String
+/// // {count} - deserialize a u32
+/// #[get("/")]
+/// async fn index(path: web::Path<(String, u32)>) -> String {
+///     let (name, count) = path.into_inner();
+///     format!("Welcome {}! {}", name, count)
 /// }
 /// ```
 ///
-/// It is possible to extract path information to a specific type that
-/// implements `Deserialize` trait from *serde*.
+/// Path segments also can be deserialized into any type that implements [`serde::Deserialize`].
+/// Path segment labels will be matched with struct field names.
 ///
-/// ```rust
-/// use actix_web::{web, App, Error};
-/// use serde_derive::Deserialize;
+/// ```
+/// use actix_web::{get, web};
+/// use serde::Deserialize;
 ///
 /// #[derive(Deserialize)]
 /// struct Info {
-///     username: String,
+///     name: String,
 /// }
 ///
-/// /// extract `Info` from a path using serde
-/// async fn index(info: web::Path<Info>) -> Result<String, Error> {
-///     Ok(format!("Welcome {}!", info.username))
-/// }
-///
-/// fn main() {
-///     let app = App::new().service(
-///         web::resource("/{username}/index.html") // <- define path parameters
-///              .route(web::get().to(index)) // <- use handler with Path` extractor
-///     );
+/// // extract `Info` from a path using serde
+/// #[get("/")]
+/// async fn index(info: web::Path<Info>) -> String {
+///     format!("Welcome {}!", info.name)
 /// }
 /// ```
-pub struct Path<T> {
-    inner: T,
-}
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+pub struct Path<T>(T);
 
 impl<T> Path<T> {
-    /// Deconstruct to an inner value
+    /// Unwrap into inner `T` value.
     pub fn into_inner(self) -> T {
-        self.inner
+        self.0
     }
 }
 
 impl<T> AsRef<T> for Path<T> {
     fn as_ref(&self) -> &T {
-        &self.inner
+        &self.0
     }
 }
 
@@ -82,80 +65,35 @@ impl<T> ops::Deref for Path<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        &self.inner
+        &self.0
     }
 }
 
 impl<T> ops::DerefMut for Path<T> {
     fn deref_mut(&mut self) -> &mut T {
-        &mut self.inner
+        &mut self.0
     }
 }
 
 impl<T> From<T> for Path<T> {
     fn from(inner: T) -> Path<T> {
-        Path { inner }
+        Path(inner)
     }
 }
 
 impl<T: fmt::Debug> fmt::Debug for Path<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.inner.fmt(f)
+        self.0.fmt(f)
     }
 }
 
 impl<T: fmt::Display> fmt::Display for Path<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.inner.fmt(f)
+        self.0.fmt(f)
     }
 }
 
-/// Extract typed information from the request's path.
-///
-/// ## Example
-///
-/// ```rust
-/// use actix_web::{web, App};
-///
-/// /// extract path info from "/{username}/{count}/index.html" url
-/// /// {username} - deserializes to a String
-/// /// {count} -  - deserializes to a u32
-/// async fn index(info: web::Path<(String, u32)>) -> String {
-///     format!("Welcome {}! {}", info.0, info.1)
-/// }
-///
-/// fn main() {
-///     let app = App::new().service(
-///         web::resource("/{username}/{count}/index.html") // <- define path parameters
-///              .route(web::get().to(index)) // <- register handler with `Path` extractor
-///     );
-/// }
-/// ```
-///
-/// It is possible to extract path information to a specific type that
-/// implements `Deserialize` trait from *serde*.
-///
-/// ```rust
-/// use actix_web::{web, App, Error};
-/// use serde_derive::Deserialize;
-///
-/// #[derive(Deserialize)]
-/// struct Info {
-///     username: String,
-/// }
-///
-/// /// extract `Info` from a path using serde
-/// async fn index(info: web::Path<Info>) -> Result<String, Error> {
-///     Ok(format!("Welcome {}!", info.username))
-/// }
-///
-/// fn main() {
-///     let app = App::new().service(
-///         web::resource("/{username}/index.html") // <- define path parameters
-///              .route(web::get().to(index)) // <- use handler with Path` extractor
-///     );
-/// }
-/// ```
+/// See [here](#usage) for example of usage as an extractor.
 impl<T> FromRequest for Path<T>
 where
     T: de::DeserializeOwned,
@@ -173,7 +111,7 @@ where
 
         ready(
             de::Deserialize::deserialize(PathDeserializer::new(req.match_info()))
-                .map(|inner| Path { inner })
+                .map(Path)
                 .map_err(move |e| {
                     log::debug!(
                         "Failed during Path extractor deserialization. \
@@ -193,10 +131,10 @@ where
 
 /// Path extractor configuration
 ///
-/// ```rust
+/// ```
 /// use actix_web::web::PathConfig;
 /// use actix_web::{error, web, App, FromRequest, HttpResponse};
-/// use serde_derive::Deserialize;
+/// use serde::Deserialize;
 ///
 /// #[derive(Deserialize, Debug)]
 /// enum Folder {
@@ -251,7 +189,7 @@ impl Default for PathConfig {
 mod tests {
     use actix_router::ResourceDef;
     use derive_more::Display;
-    use serde_derive::Deserialize;
+    use serde::Deserialize;
 
     use super::*;
     use crate::test::TestRequest;
@@ -290,21 +228,22 @@ mod tests {
         resource.match_path(req.match_info_mut());
 
         let (req, mut pl) = req.into_parts();
-        let res = <(Path<(String, String)>,)>::from_request(&req, &mut pl)
+        let (Path(res),) = <(Path<(String, String)>,)>::from_request(&req, &mut pl)
             .await
             .unwrap();
-        assert_eq!((res.0).0, "name");
-        assert_eq!((res.0).1, "user1");
+        assert_eq!(res.0, "name");
+        assert_eq!(res.1, "user1");
 
-        let res = <(Path<(String, String)>, Path<(String, String)>)>::from_request(
-            &req, &mut pl,
-        )
-        .await
-        .unwrap();
-        assert_eq!((res.0).0, "name");
-        assert_eq!((res.0).1, "user1");
-        assert_eq!((res.1).0, "name");
-        assert_eq!((res.1).1, "user1");
+        let (Path(a), Path(b)) =
+            <(Path<(String, String)>, Path<(String, String)>)>::from_request(
+                &req, &mut pl,
+            )
+            .await
+            .unwrap();
+        assert_eq!(a.0, "name");
+        assert_eq!(a.1, "user1");
+        assert_eq!(b.0, "name");
+        assert_eq!(b.1, "user1");
 
         let () = <()>::from_request(&req, &mut pl).await.unwrap();
     }
@@ -329,7 +268,7 @@ mod tests {
         let s = s.into_inner();
         assert_eq!(s.value, "user2");
 
-        let s = Path::<(String, String)>::from_request(&req, &mut pl)
+        let Path(s) = Path::<(String, String)>::from_request(&req, &mut pl)
             .await
             .unwrap();
         assert_eq!(s.0, "name");
@@ -344,7 +283,7 @@ mod tests {
         assert_eq!(s.as_ref().key, "name");
         assert_eq!(s.value, 32);
 
-        let s = Path::<(String, u8)>::from_request(&req, &mut pl)
+        let Path(s) = Path::<(String, u8)>::from_request(&req, &mut pl)
             .await
             .unwrap();
         assert_eq!(s.0, "name");

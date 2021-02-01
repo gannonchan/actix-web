@@ -1,14 +1,14 @@
 use std::io::Write;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::{io, mem, time};
+use std::{io, time};
 
-use actix_codec::{AsyncRead, AsyncWrite, Framed};
-use bytes::buf::BufMutExt;
+use actix_codec::{AsyncRead, AsyncWrite, Framed, ReadBuf};
+use bytes::buf::BufMut;
 use bytes::{Bytes, BytesMut};
 use futures_core::Stream;
 use futures_util::future::poll_fn;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{pin_mut, SinkExt, StreamExt};
 
 use crate::error::PayloadError;
 use crate::h1;
@@ -45,7 +45,7 @@ where
                 Some(port) => write!(wrt, "{}:{}", host, port),
             };
 
-            match wrt.get_mut().split().freeze().try_into() {
+            match wrt.get_mut().split().freeze().try_into_value() {
                 Ok(value) => match head {
                     RequestHeadType::Owned(ref mut head) => {
                         head.headers.insert(HOST, value)
@@ -67,17 +67,17 @@ where
     };
 
     // create Framed and send request
-    let mut framed = Framed::new(io, h1::ClientCodec::default());
-    framed.send((head, body.size()).into()).await?;
+    let mut framed_inner = Framed::new(io, h1::ClientCodec::default());
+    framed_inner.send((head, body.size()).into()).await?;
 
     // send request body
     match body.size() {
-        BodySize::None | BodySize::Empty | BodySize::Sized(0) => (),
-        _ => send_body(body, &mut framed).await?,
+        BodySize::None | BodySize::Empty | BodySize::Sized(0) => {}
+        _ => send_body(body, Pin::new(&mut framed_inner)).await?,
     };
 
     // read response and init read body
-    let res = framed.into_future().await;
+    let res = Pin::new(&mut framed_inner).into_future().await;
     let (head, framed) = if let (Some(result), framed) = res {
         let item = result.map_err(SendRequestError::from)?;
         (item, framed)
@@ -85,14 +85,14 @@ where
         return Err(SendRequestError::from(ConnectError::Disconnected));
     };
 
-    match framed.get_codec().message_type() {
+    match framed.codec_ref().message_type() {
         h1::MessageType::None => {
-            let force_close = !framed.get_codec().keepalive();
+            let force_close = !framed.codec_ref().keepalive();
             release_connection(framed, force_close);
             Ok((head, Payload::None))
         }
         _ => {
-            let pl: PayloadStream = PlStream::new(framed).boxed_local();
+            let pl: PayloadStream = PlStream::new(framed_inner).boxed_local();
             Ok((head, pl.into()))
         }
     }
@@ -119,34 +119,36 @@ where
 }
 
 /// send request body to the peer
-pub(crate) async fn send_body<I, B>(
-    mut body: B,
-    framed: &mut Framed<I, h1::ClientCodec>,
+pub(crate) async fn send_body<T, B>(
+    body: B,
+    mut framed: Pin<&mut Framed<T, h1::ClientCodec>>,
 ) -> Result<(), SendRequestError>
 where
-    I: ConnectionLifetime,
+    T: ConnectionLifetime + Unpin,
     B: MessageBody,
 {
+    pin_mut!(body);
+
     let mut eof = false;
     while !eof {
-        while !eof && !framed.is_write_buf_full() {
-            match poll_fn(|cx| body.poll_next(cx)).await {
+        while !eof && !framed.as_ref().is_write_buf_full() {
+            match poll_fn(|cx| body.as_mut().poll_next(cx)).await {
                 Some(result) => {
-                    framed.write(h1::Message::Chunk(Some(result?)))?;
+                    framed.as_mut().write(h1::Message::Chunk(Some(result?)))?;
                 }
                 None => {
                     eof = true;
-                    framed.write(h1::Message::Chunk(None))?;
+                    framed.as_mut().write(h1::Message::Chunk(None))?;
                 }
             }
         }
 
-        if !framed.is_write_buf_empty() {
-            poll_fn(|cx| match framed.flush(cx) {
+        if !framed.as_ref().is_write_buf_empty() {
+            poll_fn(|cx| match framed.as_mut().flush(cx) {
                 Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
                 Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
                 Poll::Pending => {
-                    if !framed.is_write_buf_full() {
+                    if !framed.as_ref().is_write_buf_full() {
                         Poll::Ready(Ok(()))
                     } else {
                         Poll::Pending
@@ -157,13 +159,14 @@ where
         }
     }
 
-    SinkExt::flush(framed).await?;
+    SinkExt::flush(Pin::into_inner(framed)).await?;
     Ok(())
 }
 
 #[doc(hidden)]
 /// HTTP client connection
 pub struct H1Connection<T> {
+    /// T should be `Unpin`
     io: Option<T>,
     created: time::Instant,
     pool: Option<Acquired<T>>,
@@ -174,7 +177,7 @@ where
     T: AsyncRead + AsyncWrite + Unpin + 'static,
 {
     /// Close connection
-    fn close(&mut self) {
+    fn close(mut self: Pin<&mut Self>) {
         if let Some(mut pool) = self.pool.take() {
             if let Some(io) = self.io.take() {
                 pool.close(IoConnection::new(
@@ -187,7 +190,7 @@ where
     }
 
     /// Release this connection to the connection pool
-    fn release(&mut self) {
+    fn release(mut self: Pin<&mut Self>) {
         if let Some(mut pool) = self.pool.take() {
             if let Some(io) = self.io.take() {
                 pool.release(IoConnection::new(
@@ -201,18 +204,11 @@ where
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin + 'static> AsyncRead for H1Connection<T> {
-    unsafe fn prepare_uninitialized_buffer(
-        &self,
-        buf: &mut [mem::MaybeUninit<u8>],
-    ) -> bool {
-        self.io.as_ref().unwrap().prepare_uninitialized_buffer(buf)
-    }
-
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.io.as_mut().unwrap()).poll_read(cx, buf)
     }
 }
@@ -241,14 +237,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin + 'static> AsyncWrite for H1Connection<T>
     }
 }
 
+#[pin_project::pin_project]
 pub(crate) struct PlStream<Io> {
+    #[pin]
     framed: Option<Framed<Io, h1::ClientPayloadCodec>>,
 }
 
 impl<Io: ConnectionLifetime> PlStream<Io> {
     fn new(framed: Framed<Io, h1::ClientCodec>) -> Self {
+        let framed = framed.into_map_codec(|codec| codec.into_payload_codec());
+
         PlStream {
-            framed: Some(framed.map_codec(|codec| codec.into_payload_codec())),
+            framed: Some(framed),
         }
     }
 }
@@ -260,16 +260,16 @@ impl<Io: ConnectionLifetime> Stream for PlStream<Io> {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
+        let mut this = self.project();
 
-        match this.framed.as_mut().unwrap().next_item(cx)? {
+        match this.framed.as_mut().as_pin_mut().unwrap().next_item(cx)? {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(chunk)) => {
                 if let Some(chunk) = chunk {
                     Poll::Ready(Some(Ok(chunk)))
                 } else {
-                    let framed = this.framed.take().unwrap();
-                    let force_close = !framed.get_codec().keepalive();
+                    let framed = this.framed.as_mut().as_pin_mut().unwrap();
+                    let force_close = !framed.codec_ref().keepalive();
                     release_connection(framed, force_close);
                     Poll::Ready(None)
                 }
@@ -279,14 +279,13 @@ impl<Io: ConnectionLifetime> Stream for PlStream<Io> {
     }
 }
 
-fn release_connection<T, U>(framed: Framed<T, U>, force_close: bool)
+fn release_connection<T, U>(framed: Pin<&mut Framed<T, U>>, force_close: bool)
 where
     T: ConnectionLifetime,
 {
-    let mut parts = framed.into_parts();
-    if !force_close && parts.read_buf.is_empty() && parts.write_buf.is_empty() {
-        parts.io.release()
+    if !force_close && framed.is_read_buf_empty() && framed.is_write_buf_empty() {
+        framed.io_pin().release()
     } else {
-        parts.io.close()
+        framed.io_pin().close()
     }
 }

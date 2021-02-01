@@ -5,8 +5,10 @@ use std::{fmt, net};
 use actix_http::http::{HeaderMap, Method, Uri, Version};
 use actix_http::{Error, Extensions, HttpMessage, Message, Payload, RequestHead};
 use actix_router::{Path, Url};
-use futures::future::{ok, Ready};
+use futures_util::future::{ok, Ready};
+use smallvec::SmallVec;
 
+use crate::app_service::AppInitServiceState;
 use crate::config::AppConfig;
 use crate::error::UrlGenerationError;
 use crate::extract::FromRequest;
@@ -15,16 +17,19 @@ use crate::rmap::ResourceMap;
 
 #[derive(Clone)]
 /// An HTTP Request
-pub struct HttpRequest(pub(crate) Rc<HttpRequestInner>);
+pub struct HttpRequest {
+    /// # Panics
+    /// `Rc<HttpRequestInner>` is used exclusively and NO `Weak<HttpRequestInner>`
+    /// is allowed anywhere in the code. Weak pointer is purposely ignored when
+    /// doing `Rc`'s ref counter check. Expect panics if this invariant is violated.
+    pub(crate) inner: Rc<HttpRequestInner>,
+}
 
 pub(crate) struct HttpRequestInner {
     pub(crate) head: Message<RequestHead>,
     pub(crate) path: Path<Url>,
-    pub(crate) payload: Payload,
-    pub(crate) app_data: Rc<Extensions>,
-    rmap: Rc<ResourceMap>,
-    config: AppConfig,
-    pool: &'static HttpRequestPool,
+    pub(crate) app_data: SmallVec<[Rc<Extensions>; 4]>,
+    app_state: Rc<AppInitServiceState>,
 }
 
 impl HttpRequest {
@@ -32,21 +37,20 @@ impl HttpRequest {
     pub(crate) fn new(
         path: Path<Url>,
         head: Message<RequestHead>,
-        payload: Payload,
-        rmap: Rc<ResourceMap>,
-        config: AppConfig,
+        app_state: Rc<AppInitServiceState>,
         app_data: Rc<Extensions>,
-        pool: &'static HttpRequestPool,
     ) -> HttpRequest {
-        HttpRequest(Rc::new(HttpRequestInner {
-            head,
-            path,
-            payload,
-            rmap,
-            config,
-            app_data,
-            pool,
-        }))
+        let mut data = SmallVec::<[Rc<Extensions>; 4]>::new();
+        data.push(app_data);
+
+        HttpRequest {
+            inner: Rc::new(HttpRequestInner {
+                head,
+                path,
+                app_state,
+                app_data: data,
+            }),
+        }
     }
 }
 
@@ -54,14 +58,14 @@ impl HttpRequest {
     /// This method returns reference to the request head
     #[inline]
     pub fn head(&self) -> &RequestHead {
-        &self.0.head
+        &self.inner.head
     }
 
-    /// This method returns muttable reference to the request head.
+    /// This method returns mutable reference to the request head.
     /// panics if multiple references of http request exists.
     #[inline]
     pub(crate) fn head_mut(&mut self) -> &mut RequestHead {
-        &mut Rc::get_mut(&mut self.0).unwrap().head
+        &mut Rc::get_mut(&mut self.inner).unwrap().head
     }
 
     /// Request's uri.
@@ -114,12 +118,31 @@ impl HttpRequest {
     /// access the matched value for that segment.
     #[inline]
     pub fn match_info(&self) -> &Path<Url> {
-        &self.0.path
+        &self.inner.path
     }
 
     #[inline]
     pub(crate) fn match_info_mut(&mut self) -> &mut Path<Url> {
-        &mut Rc::get_mut(&mut self.0).unwrap().path
+        &mut Rc::get_mut(&mut self.inner).unwrap().path
+    }
+
+    /// The resource definition pattern that matched the path. Useful for logging and metrics.
+    ///
+    /// For example, when a resource with pattern `/user/{id}/profile` is defined and a call is made
+    /// to `/user/123/profile` this function would return `Some("/user/{id}/profile")`.
+    ///
+    /// Returns a None when no resource is fully matched, including default services.
+    #[inline]
+    pub fn match_pattern(&self) -> Option<String> {
+        self.resource_map().match_pattern(self.path())
+    }
+
+    /// The resource name that matched the path. Useful for logging and metrics.
+    ///
+    /// Returns a None when no resource is fully matched, including default services.
+    #[inline]
+    pub fn match_name(&self) -> Option<&str> {
+        self.resource_map().match_name(self.path())
     }
 
     /// Request extensions
@@ -137,7 +160,6 @@ impl HttpRequest {
     /// Generate url for named resource
     ///
     /// ```rust
-    /// # extern crate actix_web;
     /// # use actix_web::{web, App, HttpRequest, HttpResponse};
     /// #
     /// fn index(req: HttpRequest) -> HttpResponse {
@@ -162,7 +184,7 @@ impl HttpRequest {
         U: IntoIterator<Item = I>,
         I: AsRef<str>,
     {
-        self.0.rmap.url_for(&self, name, elements)
+        self.resource_map().url_for(&self, name, elements)
     }
 
     /// Generate url for named resource
@@ -177,7 +199,7 @@ impl HttpRequest {
     #[inline]
     /// Get a reference to a `ResourceMap` of current application.
     pub fn resource_map(&self) -> &ResourceMap {
-        &self.0.rmap
+        &self.app_state().rmap()
     }
 
     /// Peer socket address
@@ -197,13 +219,13 @@ impl HttpRequest {
     /// borrowed.
     #[inline]
     pub fn connection_info(&self) -> Ref<'_, ConnectionInfo> {
-        ConnectionInfo::get(self.head(), &*self.app_config())
+        ConnectionInfo::get(self.head(), self.app_config())
     }
 
     /// App config
     #[inline]
     pub fn app_config(&self) -> &AppConfig {
-        &self.0.config
+        self.app_state().config()
     }
 
     /// Get an application data object stored with `App::data` or `App::app_data`
@@ -215,11 +237,18 @@ impl HttpRequest {
     /// let opt_t = req.app_data::<Data<T>>();
     /// ```
     pub fn app_data<T: 'static>(&self) -> Option<&T> {
-        if let Some(st) = self.0.app_data.get::<T>() {
-            Some(&st)
-        } else {
-            None
+        for container in self.inner.app_data.iter().rev() {
+            if let Some(data) = container.get::<T>() {
+                return Some(data);
+            }
         }
+
+        None
+    }
+
+    #[inline]
+    fn app_state(&self) -> &AppInitServiceState {
+        &*self.inner.app_state
     }
 }
 
@@ -235,13 +264,13 @@ impl HttpMessage for HttpRequest {
     /// Request extensions
     #[inline]
     fn extensions(&self) -> Ref<'_, Extensions> {
-        self.0.head.extensions()
+        self.inner.head.extensions()
     }
 
     /// Mutable reference to a the request's extensions
     #[inline]
     fn extensions_mut(&self) -> RefMut<'_, Extensions> {
-        self.0.head.extensions_mut()
+        self.inner.head.extensions_mut()
     }
 
     #[inline]
@@ -252,11 +281,20 @@ impl HttpMessage for HttpRequest {
 
 impl Drop for HttpRequest {
     fn drop(&mut self) {
-        if Rc::strong_count(&self.0) == 1 {
-            let v = &mut self.0.pool.0.borrow_mut();
-            if v.len() < 128 {
-                self.extensions_mut().clear();
-                v.push(self.0.clone());
+        // if possible, contribute to current worker's HttpRequest allocation pool
+
+        // This relies on no Weak<HttpRequestInner> exists anywhere.(There is none)
+        if let Some(inner) = Rc::get_mut(&mut self.inner) {
+            if inner.app_state.pool().is_available() {
+                // clear additional app_data and keep the root one for reuse.
+                inner.app_data.truncate(1);
+                // inner is borrowed mut here. get head's Extension mutably
+                // to reduce borrow check
+                inner.head.extensions.get_mut().clear();
+
+                // a re-borrow of pool is necessary here.
+                let req = self.inner.clone();
+                self.app_state().pool().push(req);
             }
         }
     }
@@ -298,8 +336,8 @@ impl fmt::Debug for HttpRequest {
         writeln!(
             f,
             "\nHttpRequest {:?} {}:{}",
-            self.0.head.version,
-            self.0.head.method,
+            self.inner.head.version,
+            self.inner.head.method,
             self.path()
         )?;
         if !self.query_string().is_empty() {
@@ -316,42 +354,78 @@ impl fmt::Debug for HttpRequest {
     }
 }
 
-/// Request's objects pool
-pub(crate) struct HttpRequestPool(RefCell<Vec<Rc<HttpRequestInner>>>);
+/// Slab-allocated `HttpRequest` Pool
+///
+/// Since request processing may yield for asynchronous events to complete, a worker may have many
+/// requests in-flight at any time. Pooling requests like this amortizes the performance and memory
+/// costs of allocating and de-allocating HttpRequest objects as frequently as they otherwise would.
+///
+/// Request objects are added when they are dropped (see `<HttpRequest as Drop>::drop`) and re-used
+/// in `<AppInitService as Service>::call` when there are available objects in the list.
+///
+/// The pool's default capacity is 128 items.
+pub(crate) struct HttpRequestPool {
+    inner: RefCell<Vec<Rc<HttpRequestInner>>>,
+    cap: usize,
+}
+
+impl Default for HttpRequestPool {
+    fn default() -> Self {
+        Self::with_capacity(128)
+    }
+}
 
 impl HttpRequestPool {
-    pub(crate) fn create() -> &'static HttpRequestPool {
-        let pool = HttpRequestPool(RefCell::new(Vec::with_capacity(128)));
-        Box::leak(Box::new(pool))
-    }
-
-    /// Get message from the pool
-    #[inline]
-    pub(crate) fn get_request(&self) -> Option<HttpRequest> {
-        if let Some(inner) = self.0.borrow_mut().pop() {
-            Some(HttpRequest(inner))
-        } else {
-            None
+    pub(crate) fn with_capacity(cap: usize) -> Self {
+        HttpRequestPool {
+            inner: RefCell::new(Vec::with_capacity(cap)),
+            cap,
         }
     }
 
+    /// Re-use a previously allocated (but now completed/discarded) HttpRequest object.
+    #[inline]
+    pub(crate) fn pop(&self) -> Option<HttpRequest> {
+        self.inner
+            .borrow_mut()
+            .pop()
+            .map(|inner| HttpRequest { inner })
+    }
+
+    /// Check if the pool still has capacity for request storage.
+    #[inline]
+    pub(crate) fn is_available(&self) -> bool {
+        self.inner.borrow_mut().len() < self.cap
+    }
+
+    /// Push a request to pool.
+    #[inline]
+    pub(crate) fn push(&self, req: Rc<HttpRequestInner>) {
+        self.inner.borrow_mut().push(req);
+    }
+
+    /// Clears all allocated HttpRequest objects.
     pub(crate) fn clear(&self) {
-        self.0.borrow_mut().clear()
+        self.inner.borrow_mut().clear()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use actix_service::Service;
+    use bytes::Bytes;
+
     use super::*;
     use crate::dev::{ResourceDef, ResourceMap};
     use crate::http::{header, StatusCode};
-    use crate::test::{call_service, init_service, TestRequest};
+    use crate::test::{call_service, init_service, read_body, TestRequest};
     use crate::{web, App, HttpResponse};
 
     #[test]
     fn test_debug() {
-        let req =
-            TestRequest::with_header("content-type", "text/plain").to_http_request();
+        let req = TestRequest::default()
+            .insert_header(("content-type", "text/plain"))
+            .to_http_request();
         let dbg = format!("{:?}", req);
         assert!(dbg.contains("HttpRequest"));
     }
@@ -365,8 +439,8 @@ mod tests {
     #[test]
     fn test_request_cookies() {
         let req = TestRequest::default()
-            .header(header::COOKIE, "cookie1=value1")
-            .header(header::COOKIE, "cookie2=value2")
+            .append_header((header::COOKIE, "cookie1=value1"))
+            .append_header((header::COOKIE, "cookie2=value2"))
             .to_http_request();
         {
             let cookies = req.cookies().unwrap();
@@ -403,7 +477,8 @@ mod tests {
         assert!(rmap.has_resource("/user/test.html"));
         assert!(!rmap.has_resource("/test/unknown"));
 
-        let req = TestRequest::with_header(header::HOST, "www.rust-lang.org")
+        let req = TestRequest::default()
+            .insert_header((header::HOST, "www.rust-lang.org"))
             .rmap(rmap)
             .to_http_request();
 
@@ -433,7 +508,7 @@ mod tests {
         assert!(rmap.has_resource("/index.html"));
 
         let req = TestRequest::with_uri("/test")
-            .header(header::HOST, "www.rust-lang.org")
+            .insert_header((header::HOST, "www.rust-lang.org"))
             .rmap(rmap)
             .to_http_request();
         let url = req.url_for_static("index");
@@ -441,6 +516,24 @@ mod tests {
             url.ok().unwrap().as_str(),
             "http://www.rust-lang.org/index.html"
         );
+    }
+
+    #[test]
+    fn test_match_name() {
+        let mut rdef = ResourceDef::new("/index.html");
+        *rdef.name_mut() = "index".to_string();
+
+        let mut rmap = ResourceMap::new(ResourceDef::new(""));
+        rmap.add(&mut rdef, None);
+
+        assert!(rmap.has_resource("/index.html"));
+
+        let req = TestRequest::default()
+            .uri("/index.html")
+            .rmap(rmap)
+            .to_http_request();
+
+        assert_eq!(req.match_name(), Some("index"));
     }
 
     #[test]
@@ -459,6 +552,25 @@ mod tests {
             url.ok().unwrap().as_str(),
             "https://youtube.com/watch/oHg5SJYRHA0"
         );
+    }
+
+    #[actix_rt::test]
+    async fn test_drop_http_request_pool() {
+        let mut srv = init_service(App::new().service(web::resource("/").to(
+            |req: HttpRequest| {
+                HttpResponse::Ok()
+                    .insert_header(("pool_cap", req.app_state().pool().cap))
+                    .finish()
+            },
+        )))
+        .await;
+
+        let req = TestRequest::default().to_request();
+        let resp = call_service(&mut srv, req).await;
+
+        drop(srv);
+
+        assert_eq!(resp.headers().get("pool_cap").unwrap(), "128");
     }
 
     #[actix_rt::test]
@@ -495,6 +607,68 @@ mod tests {
     }
 
     #[actix_rt::test]
+    async fn test_cascading_data() {
+        #[allow(dead_code)]
+        fn echo_usize(req: HttpRequest) -> HttpResponse {
+            let num = req.app_data::<usize>().unwrap();
+            HttpResponse::Ok().body(num.to_string())
+        }
+
+        let mut srv = init_service(
+            App::new()
+                .app_data(88usize)
+                .service(web::resource("/").route(web::get().to(echo_usize)))
+                .service(
+                    web::resource("/one")
+                        .app_data(1u32)
+                        .route(web::get().to(echo_usize)),
+                ),
+        )
+        .await;
+
+        let req = TestRequest::get().uri("/").to_request();
+        let resp = srv.call(req).await.unwrap();
+        let body = read_body(resp).await;
+        assert_eq!(body, Bytes::from_static(b"88"));
+
+        let req = TestRequest::get().uri("/one").to_request();
+        let resp = srv.call(req).await.unwrap();
+        let body = read_body(resp).await;
+        assert_eq!(body, Bytes::from_static(b"88"));
+    }
+
+    #[actix_rt::test]
+    async fn test_overwrite_data() {
+        #[allow(dead_code)]
+        fn echo_usize(req: HttpRequest) -> HttpResponse {
+            let num = req.app_data::<usize>().unwrap();
+            HttpResponse::Ok().body(num.to_string())
+        }
+
+        let mut srv = init_service(
+            App::new()
+                .app_data(88usize)
+                .service(web::resource("/").route(web::get().to(echo_usize)))
+                .service(
+                    web::resource("/one")
+                        .app_data(1usize)
+                        .route(web::get().to(echo_usize)),
+                ),
+        )
+        .await;
+
+        let req = TestRequest::get().uri("/").to_request();
+        let resp = srv.call(req).await.unwrap();
+        let body = read_body(resp).await;
+        assert_eq!(body, Bytes::from_static(b"88"));
+
+        let req = TestRequest::get().uri("/one").to_request();
+        let resp = srv.call(req).await.unwrap();
+        let body = read_body(resp).await;
+        assert_eq!(body, Bytes::from_static(b"1"));
+    }
+
+    #[actix_rt::test]
     async fn test_extensions_dropped() {
         struct Tracker {
             pub dropped: bool,
@@ -527,5 +701,73 @@ mod tests {
         }
 
         assert!(tracker.borrow().dropped);
+    }
+
+    #[actix_rt::test]
+    async fn extract_path_pattern() {
+        let mut srv = init_service(
+            App::new().service(
+                web::scope("/user/{id}")
+                    .service(web::resource("/profile").route(web::get().to(
+                        move |req: HttpRequest| {
+                            assert_eq!(
+                                req.match_pattern(),
+                                Some("/user/{id}/profile".to_owned())
+                            );
+
+                            HttpResponse::Ok().finish()
+                        },
+                    )))
+                    .default_service(web::to(move |req: HttpRequest| {
+                        assert!(req.match_pattern().is_none());
+                        HttpResponse::Ok().finish()
+                    })),
+            ),
+        )
+        .await;
+
+        let req = TestRequest::get().uri("/user/22/profile").to_request();
+        let res = call_service(&mut srv, req).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let req = TestRequest::get().uri("/user/22/not-exist").to_request();
+        let res = call_service(&mut srv, req).await;
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[actix_rt::test]
+    async fn extract_path_pattern_complex() {
+        let mut srv = init_service(
+            App::new()
+                .service(web::scope("/user").service(web::scope("/{id}").service(
+                    web::resource("").to(move |req: HttpRequest| {
+                        assert_eq!(req.match_pattern(), Some("/user/{id}".to_owned()));
+
+                        HttpResponse::Ok().finish()
+                    }),
+                )))
+                .service(web::resource("/").to(move |req: HttpRequest| {
+                    assert_eq!(req.match_pattern(), Some("/".to_owned()));
+
+                    HttpResponse::Ok().finish()
+                }))
+                .default_service(web::to(move |req: HttpRequest| {
+                    assert!(req.match_pattern().is_none());
+                    HttpResponse::Ok().finish()
+                })),
+        )
+        .await;
+
+        let req = TestRequest::get().uri("/user/test").to_request();
+        let res = call_service(&mut srv, req).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let req = TestRequest::get().uri("/").to_request();
+        let res = call_service(&mut srv, req).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let req = TestRequest::get().uri("/not-exist").to_request();
+        let res = call_service(&mut srv, req).await;
+        assert_eq!(res.status(), StatusCode::OK);
     }
 }

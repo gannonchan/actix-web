@@ -1,9 +1,8 @@
-use actix_service::ServiceFactory;
-use bytes::Bytes;
-use futures::future::{self, ok};
-
 use actix_http::{http, HttpService, Request, Response};
 use actix_http_test::test_server;
+use actix_service::ServiceFactoryExt;
+use bytes::Bytes;
+use futures_util::future::{self, ok};
 
 const STR: &str = "Hello World Hello World Hello World Hello World Hello World \
                    Hello World Hello World Hello World Hello World Hello World \
@@ -33,12 +32,13 @@ async fn test_h1_v2() {
         HttpService::build()
             .finish(|_| future::ok::<_, ()>(Response::Ok().body(STR)))
             .tcp()
-    });
+    })
+    .await;
 
     let response = srv.get("/").send().await.unwrap();
     assert!(response.status().is_success());
 
-    let request = srv.get("/").header("x-test", "111").send();
+    let request = srv.get("/").insert_header(("x-test", "111")).send();
     let mut response = request.await.unwrap();
     assert!(response.status().is_success());
 
@@ -61,7 +61,8 @@ async fn test_connection_close() {
             .finish(|_| ok::<_, ()>(Response::Ok().body(STR)))
             .tcp()
             .map(|_| ())
-    });
+    })
+    .await;
 
     let response = srv.get("/").force_close().send().await.unwrap();
     assert!(response.status().is_success());
@@ -80,7 +81,8 @@ async fn test_with_query_parameter() {
             })
             .tcp()
             .map(|_| ())
-    });
+    })
+    .await;
 
     let request = srv.request(http::Method::GET, srv.url("/?qp=5"));
     let response = request.send().await.unwrap();

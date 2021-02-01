@@ -12,7 +12,6 @@ use actix_router::{IntoPattern, Path, Resource, ResourceDef, Url};
 use actix_service::{IntoServiceFactory, ServiceFactory};
 
 use crate::config::{AppConfig, AppService};
-use crate::data::Data;
 use crate::dev::insert_slash;
 use crate::guard::Guard;
 use crate::info::ConnectionInfo;
@@ -53,71 +52,61 @@ where
 /// An service http request
 ///
 /// ServiceRequest allows mutable access to request's internal structures
-pub struct ServiceRequest(HttpRequest);
+pub struct ServiceRequest {
+    req: HttpRequest,
+    payload: Payload,
+}
 
 impl ServiceRequest {
     /// Construct service request
-    pub(crate) fn new(req: HttpRequest) -> Self {
-        ServiceRequest(req)
+    pub(crate) fn new(req: HttpRequest, payload: Payload) -> Self {
+        Self { req, payload }
     }
 
     /// Deconstruct request into parts
-    pub fn into_parts(mut self) -> (HttpRequest, Payload) {
-        let pl = Rc::get_mut(&mut (self.0).0).unwrap().payload.take();
-        (self.0, pl)
+    #[inline]
+    pub fn into_parts(self) -> (HttpRequest, Payload) {
+        (self.req, self.payload)
     }
 
     /// Construct request from parts.
-    ///
-    /// `ServiceRequest` can be re-constructed only if `req` hasnt been cloned.
-    pub fn from_parts(
-        mut req: HttpRequest,
-        pl: Payload,
-    ) -> Result<Self, (HttpRequest, Payload)> {
-        if Rc::strong_count(&req.0) == 1 && Rc::weak_count(&req.0) == 0 {
-            Rc::get_mut(&mut req.0).unwrap().payload = pl;
-            Ok(ServiceRequest(req))
-        } else {
-            Err((req, pl))
-        }
+    pub fn from_parts(req: HttpRequest, payload: Payload) -> Self {
+        Self { req, payload }
     }
 
     /// Construct request from request.
     ///
-    /// `HttpRequest` implements `Clone` trait via `Rc` type. `ServiceRequest`
-    /// can be re-constructed only if rc's strong pointers count eq 1 and
-    /// weak pointers count is 0.
-    pub fn from_request(req: HttpRequest) -> Result<Self, HttpRequest> {
-        if Rc::strong_count(&req.0) == 1 && Rc::weak_count(&req.0) == 0 {
-            Ok(ServiceRequest(req))
-        } else {
-            Err(req)
+    /// The returned `ServiceRequest` would have no payload.
+    pub fn from_request(req: HttpRequest) -> Self {
+        ServiceRequest {
+            req,
+            payload: Payload::None,
         }
     }
 
     /// Create service response
     #[inline]
     pub fn into_response<B, R: Into<Response<B>>>(self, res: R) -> ServiceResponse<B> {
-        ServiceResponse::new(self.0, res.into())
+        ServiceResponse::new(self.req, res.into())
     }
 
     /// Create service response for error
     #[inline]
     pub fn error_response<B, E: Into<Error>>(self, err: E) -> ServiceResponse<B> {
         let res: Response = err.into().into();
-        ServiceResponse::new(self.0, res.into_body())
+        ServiceResponse::new(self.req, res.into_body())
     }
 
     /// This method returns reference to the request head
     #[inline]
     pub fn head(&self) -> &RequestHead {
-        &self.0.head()
+        &self.req.head()
     }
 
     /// This method returns reference to the request head
     #[inline]
     pub fn head_mut(&mut self) -> &mut RequestHead {
-        self.0.head_mut()
+        self.req.head_mut()
     }
 
     /// Request's uri.
@@ -193,46 +182,64 @@ impl ServiceRequest {
     /// access the matched value for that segment.
     #[inline]
     pub fn match_info(&self) -> &Path<Url> {
-        self.0.match_info()
+        self.req.match_info()
+    }
+
+    /// Counterpart to [`HttpRequest::match_name`](super::HttpRequest::match_name()).
+    #[inline]
+    pub fn match_name(&self) -> Option<&str> {
+        self.req.match_name()
+    }
+
+    /// Counterpart to [`HttpRequest::match_pattern`](super::HttpRequest::match_pattern()).
+    #[inline]
+    pub fn match_pattern(&self) -> Option<String> {
+        self.req.match_pattern()
     }
 
     #[inline]
     /// Get a mutable reference to the Path parameters.
     pub fn match_info_mut(&mut self) -> &mut Path<Url> {
-        self.0.match_info_mut()
+        self.req.match_info_mut()
     }
 
     #[inline]
     /// Get a reference to a `ResourceMap` of current application.
     pub fn resource_map(&self) -> &ResourceMap {
-        self.0.resource_map()
+        self.req.resource_map()
     }
 
     /// Service configuration
     #[inline]
     pub fn app_config(&self) -> &AppConfig {
-        self.0.app_config()
+        self.req.app_config()
     }
 
-    /// Get an application data stored with `App::data()` method during
-    /// application configuration.
-    pub fn app_data<T: 'static>(&self) -> Option<Data<T>> {
-        if let Some(st) = (self.0).0.app_data.get::<Data<T>>() {
-            Some(st.clone())
-        } else {
-            None
+    /// Counterpart to [`HttpRequest::app_data`](super::HttpRequest::app_data()).
+    pub fn app_data<T: 'static>(&self) -> Option<&T> {
+        for container in self.req.inner.app_data.iter().rev() {
+            if let Some(data) = container.get::<T>() {
+                return Some(data);
+            }
         }
+
+        None
     }
 
     /// Set request payload.
     pub fn set_payload(&mut self, payload: Payload) {
-        Rc::get_mut(&mut (self.0).0).unwrap().payload = payload;
+        self.payload = payload;
     }
 
-    #[doc(hidden)]
-    /// Set new app data container
-    pub fn set_data_container(&mut self, extensions: Rc<Extensions>) {
-        Rc::get_mut(&mut (self.0).0).unwrap().app_data = extensions;
+    /// Add data container to request's resolution set.
+    ///
+    /// In middleware, prefer [`extensions_mut`](ServiceRequest::extensions_mut) for request-local
+    /// data since it is assumed that the same app data is presented for every request.
+    pub fn add_data_container(&mut self, extensions: Rc<Extensions>) {
+        Rc::get_mut(&mut (self.req).inner)
+            .unwrap()
+            .app_data
+            .push(extensions);
     }
 }
 
@@ -254,18 +261,18 @@ impl HttpMessage for ServiceRequest {
     /// Request extensions
     #[inline]
     fn extensions(&self) -> Ref<'_, Extensions> {
-        self.0.extensions()
+        self.req.extensions()
     }
 
     /// Mutable reference to a the request's extensions
     #[inline]
     fn extensions_mut(&self) -> RefMut<'_, Extensions> {
-        self.0.extensions_mut()
+        self.req.extensions_mut()
     }
 
     #[inline]
     fn take_payload(&mut self) -> Payload<Self::Stream> {
-        Rc::get_mut(&mut (self.0).0).unwrap().payload.take()
+        self.payload.take()
     }
 }
 
@@ -397,9 +404,9 @@ impl<B> ServiceResponse<B> {
     }
 }
 
-impl<B> Into<Response<B>> for ServiceResponse<B> {
-    fn into(self) -> Response<B> {
-        self.response
+impl<B> From<ServiceResponse<B>> for Response<B> {
+    fn from(res: ServiceResponse<B>) -> Response<B> {
+        res.response
     }
 }
 
@@ -471,10 +478,10 @@ impl WebService {
     /// Set a service factory implementation and generate web service.
     pub fn finish<T, F>(self, service: F) -> impl HttpServiceFactory
     where
-        F: IntoServiceFactory<T>,
+        F: IntoServiceFactory<T, ServiceRequest>,
         T: ServiceFactory<
+                ServiceRequest,
                 Config = (),
-                Request = ServiceRequest,
                 Response = ServiceResponse,
                 Error = Error,
                 InitError = (),
@@ -499,8 +506,8 @@ struct WebServiceImpl<T> {
 impl<T> HttpServiceFactory for WebServiceImpl<T>
 where
     T: ServiceFactory<
+            ServiceRequest,
             Config = (),
-            Request = ServiceRequest,
             Response = ServiceResponse,
             Error = Error,
             InitError = (),
@@ -510,7 +517,7 @@ where
         let guards = if self.guards.is_empty() {
             None
         } else {
-            Some(std::mem::replace(&mut self.guards, Vec::new()))
+            Some(std::mem::take(&mut self.guards))
         };
 
         let mut rdef = if config.is_root() || !self.rdef.is_empty() {
@@ -531,28 +538,7 @@ mod tests {
     use crate::test::{init_service, TestRequest};
     use crate::{guard, http, web, App, HttpResponse};
     use actix_service::Service;
-    use futures::future::ok;
-
-    #[test]
-    fn test_service_request() {
-        let req = TestRequest::default().to_srv_request();
-        let (r, pl) = req.into_parts();
-        assert!(ServiceRequest::from_parts(r, pl).is_ok());
-
-        let req = TestRequest::default().to_srv_request();
-        let (r, pl) = req.into_parts();
-        let _r2 = r.clone();
-        assert!(ServiceRequest::from_parts(r, pl).is_err());
-
-        let req = TestRequest::default().to_srv_request();
-        let (r, _pl) = req.into_parts();
-        assert!(ServiceRequest::from_request(r).is_ok());
-
-        let req = TestRequest::default().to_srv_request();
-        let (r, _pl) = req.into_parts();
-        let _r2 = r.clone();
-        assert!(ServiceRequest::from_request(r).is_err());
-    }
+    use futures_util::future::ok;
 
     #[actix_rt::test]
     async fn test_service() {
@@ -579,18 +565,39 @@ mod tests {
         assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
     }
 
+    #[actix_rt::test]
+    async fn test_service_data() {
+        let mut srv = init_service(
+            App::new()
+                .data(42u32)
+                .service(web::service("/test").name("test").finish(
+                    |req: ServiceRequest| {
+                        assert_eq!(
+                            req.app_data::<web::Data<u32>>().unwrap().as_ref(),
+                            &42
+                        );
+                        ok(req.into_response(HttpResponse::Ok().finish()))
+                    },
+                )),
+        )
+        .await;
+        let req = TestRequest::with_uri("/test").to_request();
+        let resp = srv.call(req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+    }
+
     #[test]
     fn test_fmt_debug() {
         let req = TestRequest::get()
             .uri("/index.html?test=1")
-            .header("x-test", "111")
+            .insert_header(("x-test", "111"))
             .to_srv_request();
         let s = format!("{:?}", req);
         assert!(s.contains("ServiceRequest"));
         assert!(s.contains("test=1"));
         assert!(s.contains("x-test"));
 
-        let res = HttpResponse::Ok().header("x-test", "111").finish();
+        let res = HttpResponse::Ok().insert_header(("x-test", "111")).finish();
         let res = TestRequest::post()
             .uri("/index.html?test=1")
             .to_srv_response(res);

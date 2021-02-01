@@ -1,10 +1,251 @@
 # Changes
 
-## [2.0.NEXT] - 2020-01-xx
+## Unreleased - 2021-xx-xx
+### Added
+* The method `Either<web::Json<T>, web::Form<T>>::into_inner()` which returns the inner type for
+  whichever variant was created. Also works for `Either<web::Form<T>, web::Json<T>>`. [#1894]
+
+### Changed
+* Rework `Responder` trait to be sync and returns `Response`/`HttpResponse` directly.
+  Making it more simple and performant. [#1891]
+* `ServiceRequest::into_parts` and `ServiceRequest::from_parts` would not fail.
+  `ServiceRequest::from_request` would not fail and no payload would be generated [#1893]
+* Our `Either` type now uses `Left`/`Right` variants (instead of `A`/`B`) [#1894]
+
+### Fixed
+* Multiple calls `App::data` with the same type now keeps the latest call's data. [#1906]
+
+### Removed
+* Public field of `web::Path` has been made private. [#1894]
+* Public field of `web::Query` has been made private. [#1894]
+* `TestRequest::with_header`; use `TestRequest::default().insert_header()`. [#1869]
+* `AppService::set_service_data`; for custom HTTP service factories adding application data, use the
+  layered data model by calling `ServiceRequest::add_data_container` when handling
+  requests instead. [#1906]
+
+[#1891]: https://github.com/actix/actix-web/pull/1891
+[#1893]: https://github.com/actix/actix-web/pull/1893
+[#1894]: https://github.com/actix/actix-web/pull/1894
+[#1869]: https://github.com/actix/actix-web/pull/1869
+[#1906]: https://github.com/actix/actix-web/pull/1906
+
+
+## 4.0.0-beta.1 - 2021-01-07
+### Added
+* `Compat` middleware enabling generic response body/error type of middlewares like `Logger` and
+  `Compress` to be used in `middleware::Condition` and `Resource`, `Scope` services. [#1865]
+
+### Changed
+* Update `actix-*` dependencies to tokio `1.0` based versions. [#1813]
+* Bumped `rand` to `0.8`.
+* Update `rust-tls` to `0.19`. [#1813]
+* Rename `Handler` to `HandlerService` and rename `Factory` to `Handler`. [#1852]
+* The default `TrailingSlash` is now `Trim`, in line with existing documentation. See migration
+  guide for implications. [#1875]
+* Rename `DefaultHeaders::{content_type => add_content_type}`. [#1875]
+* MSRV is now 1.46.0.
+
+### Fixed
+* Added the underlying parse error to `test::read_body_json`'s panic message. [#1812]
+
+### Removed
+* Public modules `middleware::{normalize, err_handlers}`. All necessary middleware structs are now
+  exposed directly by the `middleware` module.
+* Remove `actix-threadpool` as dependency. `actix_threadpool::BlockingError` error type can be imported 
+  from `actix_web::error` module. [#1878]
+
+[#1812]: https://github.com/actix/actix-web/pull/1812
+[#1813]: https://github.com/actix/actix-web/pull/1813
+[#1852]: https://github.com/actix/actix-web/pull/1852
+[#1865]: https://github.com/actix/actix-web/pull/1865
+[#1875]: https://github.com/actix/actix-web/pull/1875
+[#1878]: https://github.com/actix/actix-web/pull/1878
+
+## 3.3.2 - 2020-12-01
+### Fixed
+* Removed an occasional `unwrap` on `None` panic in `NormalizePathNormalization`. [#1762]
+* Fix `match_pattern()` returning `None` for scope with empty path resource. [#1798]
+* Increase minimum `socket2` version. [#1803]
+
+[#1762]: https://github.com/actix/actix-web/pull/1762
+[#1798]: https://github.com/actix/actix-web/pull/1798
+[#1803]: https://github.com/actix/actix-web/pull/1803
+
+
+## 3.3.1 - 2020-11-29
+* Ensure `actix-http` dependency uses same `serde_urlencoded`.
+
+
+## 3.3.0 - 2020-11-25
+### Added
+* Add `Either<A, B>` extractor helper. [#1788]
+
+### Changed
+* Upgrade `serde_urlencoded` to `0.7`. [#1773]
+
+[#1773]: https://github.com/actix/actix-web/pull/1773
+[#1788]: https://github.com/actix/actix-web/pull/1788
+
+
+## 3.2.0 - 2020-10-30
+### Added
+* Implement `exclude_regex` for Logger middleware. [#1723]
+* Add request-local data extractor `web::ReqData`. [#1748]
+* Add ability to register closure for request middleware logging. [#1749]
+* Add `app_data` to `ServiceConfig`. [#1757]
+* Expose `on_connect` for access to the connection stream before request is handled. [#1754]
+
+### Changed
+* Updated actix-web-codegen dependency for access to new `#[route(...)]` multi-method macro.
+* Print non-configured `Data<T>` type when attempting extraction. [#1743]
+* Re-export bytes::Buf{Mut} in web module. [#1750]
+* Upgrade `pin-project` to `1.0`.
+
+[#1723]: https://github.com/actix/actix-web/pull/1723
+[#1743]: https://github.com/actix/actix-web/pull/1743
+[#1748]: https://github.com/actix/actix-web/pull/1748
+[#1750]: https://github.com/actix/actix-web/pull/1750
+[#1754]: https://github.com/actix/actix-web/pull/1754
+[#1749]: https://github.com/actix/actix-web/pull/1749
+
+
+## 3.1.0 - 2020-09-29
+### Changed
+* Add `TrailingSlash::MergeOnly` behaviour to `NormalizePath`, which allows `NormalizePath`
+  to retain any trailing slashes. [#1695]
+* Remove bound `std::marker::Sized` from `web::Data` to support storing `Arc<dyn Trait>`
+  via `web::Data::from` [#1710]
+
+### Fixed
+* `ResourceMap` debug printing is no longer infinitely recursive. [#1708]
+
+[#1695]: https://github.com/actix/actix-web/pull/1695
+[#1708]: https://github.com/actix/actix-web/pull/1708
+[#1710]: https://github.com/actix/actix-web/pull/1710
+
+
+## 3.0.2 - 2020-09-15
+### Fixed
+* `NormalizePath` when used with `TrailingSlash::Trim` no longer trims the root path "/". [#1678]
+
+[#1678]: https://github.com/actix/actix-web/pull/1678
+
+
+## 3.0.1 - 2020-09-13
+### Changed
+* `middleware::normalize::TrailingSlash` enum is now accessible. [#1673]
+
+[#1673]: https://github.com/actix/actix-web/pull/1673
+
+
+## 3.0.0 - 2020-09-11
+* No significant changes from `3.0.0-beta.4`.
+
+
+## 3.0.0-beta.4 - 2020-09-09
+### Added
+* `middleware::NormalizePath` now has configurable behaviour for either always having a trailing
+  slash, or as the new addition, always trimming trailing slashes. [#1639]
+
+### Changed
+* Update actix-codec and actix-utils dependencies. [#1634]
+* `FormConfig` and `JsonConfig` configurations are now also considered when set
+  using `App::data`. [#1641]
+* `HttpServer::maxconn` is renamed to the more expressive `HttpServer::max_connections`. [#1655]
+* `HttpServer::maxconnrate` is renamed to the more expressive
+  `HttpServer::max_connection_rate`. [#1655]
+
+[#1639]: https://github.com/actix/actix-web/pull/1639
+[#1641]: https://github.com/actix/actix-web/pull/1641
+[#1634]: https://github.com/actix/actix-web/pull/1634
+[#1655]: https://github.com/actix/actix-web/pull/1655
+
+## 3.0.0-beta.3 - 2020-08-17
+### Changed
+* Update `rustls` to 0.18
+
+
+## 3.0.0-beta.2 - 2020-08-17
+### Changed
+* `PayloadConfig` is now also considered in `Bytes` and `String` extractors when set
+  using `App::data`. [#1610]
+* `web::Path` now has a public representation: `web::Path(pub T)` that enables
+  destructuring. [#1594]
+* `ServiceRequest::app_data` allows retrieval of non-Data data without splitting into parts to
+  access `HttpRequest` which already allows this. [#1618]
+* Re-export all error types from `awc`. [#1621]
+* MSRV is now 1.42.0.
+
+### Fixed
+* Memory leak of app data in pooled requests. [#1609]
+
+[#1594]: https://github.com/actix/actix-web/pull/1594
+[#1609]: https://github.com/actix/actix-web/pull/1609
+[#1610]: https://github.com/actix/actix-web/pull/1610
+[#1618]: https://github.com/actix/actix-web/pull/1618
+[#1621]: https://github.com/actix/actix-web/pull/1621
+
+
+## 3.0.0-beta.1 - 2020-07-13
+### Added
+* Re-export `actix_rt::main` as `actix_web::main`.
+* `HttpRequest::match_pattern` and `ServiceRequest::match_pattern` for extracting the matched
+  resource pattern.
+* `HttpRequest::match_name` and `ServiceRequest::match_name` for extracting matched resource name.
+
+### Changed
+* Fix actix_http::h1::dispatcher so it returns when HW_BUFFER_SIZE is reached. Should reduce peak memory consumption during large uploads. [#1550]
+* Migrate cookie handling to `cookie` crate. Actix-web no longer requires `ring` dependency.
+* MSRV is now 1.41.1
+
+### Fixed
+* `NormalizePath` improved consistency when path needs slashes added _and_ removed.
+
+
+## 3.0.0-alpha.3 - 2020-05-21
+### Added
+* Add option to create `Data<T>` from `Arc<T>` [#1509]
+
+### Changed
+* Resources and Scopes can now access non-overridden data types set on App (or containing scopes) when setting their own data. [#1486]
+* Fix audit issue logging by default peer address [#1485]
+* Bump minimum supported Rust version to 1.40
+* Replace deprecated `net2` crate with `socket2`
+
+[#1485]: https://github.com/actix/actix-web/pull/1485
+[#1509]: https://github.com/actix/actix-web/pull/1509
+
+## [3.0.0-alpha.2] - 2020-05-08
 
 ### Changed
 
-*  Use `sha-1` crate instead of unmaintained `sha1` crate
+* `{Resource,Scope}::default_service(f)` handlers now support app data extraction. [#1452]
+* Implement `std::error::Error` for our custom errors [#1422]
+* NormalizePath middleware now appends trailing / so that routes of form /example/ respond to /example requests. [#1433]
+* Remove the `failure` feature and support.
+
+[#1422]: https://github.com/actix/actix-web/pull/1422
+[#1433]: https://github.com/actix/actix-web/pull/1433
+[#1452]: https://github.com/actix/actix-web/pull/1452
+[#1486]: https://github.com/actix/actix-web/pull/1486
+
+
+## [3.0.0-alpha.1] - 2020-03-11
+
+### Added
+
+* Add helper function for creating routes with `TRACE` method guard `web::trace()`
+* Add convenience functions `test::read_body_json()` and `test::TestRequest::send_request()` for testing.
+
+### Changed
+
+* Use `sha-1` crate instead of unmaintained `sha1` crate
+* Skip empty chunks when returning response from a `Stream` [#1308]
+* Update the `time` dependency to 0.2.7
+* Update `actix-tls` dependency to 2.0.0-alpha.1
+* Update `rustls` dependency to 0.17
+
+[#1308]: https://github.com/actix/actix-web/pull/1308
 
 ## [2.0.0] - 2019-12-25
 
@@ -51,7 +292,7 @@
 
 ### Deleted
 
-* Delete HttpServer::run(), it is not useful witht async/await
+* Delete HttpServer::run(), it is not useful with async/await
 
 ## [2.0.0-alpha.3] - 2019-12-07
 
@@ -96,7 +337,7 @@
 
 ### Changed
 
-* Make UrlEncodedError::Overflow more informativve
+* Make UrlEncodedError::Overflow more informative
 
 * Use actix-testing for testing utils
 
@@ -114,7 +355,7 @@
 
 * Re-implement Host predicate (#989)
 
-* Form immplements Responder, returning a `application/x-www-form-urlencoded` response
+* Form implements Responder, returning a `application/x-www-form-urlencoded` response
 
 * Add `into_inner` to `Data`
 

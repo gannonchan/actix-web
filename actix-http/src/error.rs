@@ -1,5 +1,5 @@
 //! Error and Result module
-use std::any::TypeId;
+
 use std::cell::RefCell;
 use std::io::Write;
 use std::str::Utf8Error;
@@ -7,26 +7,23 @@ use std::string::FromUtf8Error;
 use std::{fmt, io, result};
 
 use actix_codec::{Decoder, Encoder};
-pub use actix_threadpool::BlockingError;
-use actix_utils::framed::DispatcherError as FramedDispatcherError;
+use actix_utils::dispatcher::DispatcherError as FramedDispatcherError;
 use actix_utils::timeout::TimeoutError;
 use bytes::BytesMut;
 use derive_more::{Display, From};
 pub use futures_channel::oneshot::Canceled;
 use http::uri::InvalidUri;
 use http::{header, Error as HttpError, StatusCode};
-use httparse;
 use serde::de::value::Error as DeError;
 use serde_json::error::Error as JsonError;
 use serde_urlencoded::ser::Error as FormError;
 
-// re-export for convinience
 use crate::body::Body;
 pub use crate::cookie::ParseError as CookieParseError;
 use crate::helpers::Writer;
 use crate::response::{Response, ResponseBuilder};
 
-/// A specialized [`Result`](https://doc.rust-lang.org/std/result/enum.Result.html)
+/// A specialized [`std::result::Result`]
 /// for actix web operations
 ///
 /// This typedef is generally used to avoid writing out
@@ -36,7 +33,7 @@ pub type Result<T, E = Error> = result::Result<T, E>;
 
 /// General purpose actix web error.
 ///
-/// An actix web error is used to carry errors from `failure` or `std::error`
+/// An actix web error is used to carry errors from `std::error`
 /// through actix in a convenient way.  It can be created through
 /// converting errors with `into()`.
 ///
@@ -83,25 +80,10 @@ pub trait ResponseError: fmt::Debug + fmt::Display {
         resp.set_body(Body::from(buf))
     }
 
-    #[doc(hidden)]
-    fn __private_get_type_id__(&self) -> TypeId
-    where
-        Self: 'static,
-    {
-        TypeId::of::<Self>()
-    }
+    downcast_get_type_id!();
 }
 
-impl dyn ResponseError + 'static {
-    /// Downcasts a response error to a specific type.
-    pub fn downcast_ref<T: ResponseError + 'static>(&self) -> Option<&T> {
-        if self.__private_get_type_id__() == TypeId::of::<T>() {
-            unsafe { Some(&*(self as *const dyn ResponseError as *const T)) }
-        } else {
-            None
-        }
-    }
-}
+downcast!(ResponseError);
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -116,10 +98,6 @@ impl fmt::Debug for Error {
 }
 
 impl std::error::Error for Error {
-    fn cause(&self) -> Option<&dyn std::error::Error> {
-        None
-    }
-
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         None
     }
@@ -194,11 +172,7 @@ impl ResponseError for FormError {}
 
 #[cfg(feature = "openssl")]
 /// `InternalServerError` for `openssl::ssl::Error`
-impl ResponseError for actix_connect::ssl::openssl::SslError {}
-
-#[cfg(feature = "openssl")]
-/// `InternalServerError` for `openssl::ssl::HandshakeError`
-impl<T: std::fmt::Debug> ResponseError for actix_tls::openssl::HandshakeError<T> {}
+impl ResponseError for actix_tls::accept::openssl::SslError {}
 
 /// Return `BAD_REQUEST` for `de::value::Error`
 impl ResponseError for DeError {
@@ -209,9 +183,6 @@ impl ResponseError for DeError {
 
 /// `InternalServerError` for `Canceled`
 impl ResponseError for Canceled {}
-
-/// `InternalServerError` for `BlockingError`
-impl<E: fmt::Debug> ResponseError for BlockingError<E> {}
 
 /// Return `BAD_REQUEST` for `Utf8Error`
 impl ResponseError for Utf8Error {
@@ -324,30 +295,63 @@ impl From<httparse::Error> for ParseError {
     }
 }
 
+/// A set of errors that can occur running blocking tasks in thread pool.
+#[derive(Debug, Display)]
+pub enum BlockingError<E: fmt::Debug> {
+    #[display(fmt = "{:?}", _0)]
+    Error(E),
+    #[display(fmt = "Thread pool is gone")]
+    Canceled,
+}
+
+impl<E: fmt::Debug> std::error::Error for BlockingError<E> {}
+
+/// `InternalServerError` for `BlockingError`
+impl<E: fmt::Debug> ResponseError for BlockingError<E> {}
+
 #[derive(Display, Debug)]
 /// A set of errors that can occur during payload parsing
 pub enum PayloadError {
     /// A payload reached EOF, but is not complete.
     #[display(
-        fmt = "A payload reached EOF, but is not complete. With error: {:?}",
+        fmt = "A payload reached EOF, but is not complete. Inner error: {:?}",
         _0
     )]
     Incomplete(Option<io::Error>),
-    /// Content encoding stream corruption
+
+    /// Content encoding stream corruption.
     #[display(fmt = "Can not decode content-encoding.")]
     EncodingCorrupted,
-    /// A payload reached size limit.
-    #[display(fmt = "A payload reached size limit.")]
+
+    /// Payload reached size limit.
+    #[display(fmt = "Payload reached size limit.")]
     Overflow,
-    /// A payload length is unknown.
-    #[display(fmt = "A payload length is unknown.")]
+
+    /// Payload length is unknown.
+    #[display(fmt = "Payload length is unknown.")]
     UnknownLength,
-    /// Http2 payload error
+
+    /// HTTP/2 payload error.
     #[display(fmt = "{}", _0)]
     Http2Payload(h2::Error),
-    /// Io error
+
+    /// Generic I/O error.
     #[display(fmt = "{}", _0)]
     Io(io::Error),
+}
+
+impl std::error::Error for PayloadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PayloadError::Incomplete(None) => None,
+            PayloadError::Incomplete(Some(err)) => Some(err as &dyn std::error::Error),
+            PayloadError::EncodingCorrupted => None,
+            PayloadError::Overflow => None,
+            PayloadError::UnknownLength => None,
+            PayloadError::Http2Payload(err) => Some(err as &dyn std::error::Error),
+            PayloadError::Io(err) => Some(err as &dyn std::error::Error),
+        }
+    }
 }
 
 impl From<h2::Error> for PayloadError {
@@ -447,7 +451,7 @@ pub enum DispatchError {
     Unknown,
 }
 
-/// A set of error that can occure during parsing content type
+/// A set of error that can occur during parsing content type
 #[derive(PartialEq, Debug, Display)]
 pub enum ContentTypeError {
     /// Can not parse content type
@@ -458,6 +462,8 @@ pub enum ContentTypeError {
     UnknownEncoding,
 }
 
+impl std::error::Error for ContentTypeError {}
+
 /// Return `BadRequest` for `ContentTypeError`
 impl ResponseError for ContentTypeError {
     fn status_code(&self) -> StatusCode {
@@ -465,10 +471,10 @@ impl ResponseError for ContentTypeError {
     }
 }
 
-impl<E, U: Encoder + Decoder> ResponseError for FramedDispatcherError<E, U>
+impl<E, U: Encoder<I> + Decoder, I> ResponseError for FramedDispatcherError<E, U, I>
 where
     E: fmt::Debug + fmt::Display,
-    <U as Encoder>::Error: fmt::Debug,
+    <U as Encoder<I>>::Error: fmt::Debug,
     <U as Decoder>::Error: fmt::Debug,
 {
 }
@@ -963,15 +969,15 @@ where
     InternalError::new(err, StatusCode::NETWORK_AUTHENTICATION_REQUIRED).into()
 }
 
-#[cfg(feature = "failure")]
-/// Compatibility for `failure::Error`
-impl ResponseError for fail_ure::Error {}
+#[cfg(feature = "actors")]
+/// `InternalServerError` for `actix::MailboxError`
+/// This is supported on feature=`actors` only
+impl ResponseError for actix::MailboxError {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use http::{Error as HttpError, StatusCode};
-    use httparse;
     use std::io;
 
     #[test]
@@ -1025,22 +1031,22 @@ mod tests {
     fn test_payload_error() {
         let err: PayloadError =
             io::Error::new(io::ErrorKind::Other, "ParseError").into();
-        assert!(format!("{}", err).contains("ParseError"));
+        assert!(err.to_string().contains("ParseError"));
 
         let err = PayloadError::Incomplete(None);
         assert_eq!(
-            format!("{}", err),
-            "A payload reached EOF, but is not complete. With error: None"
+            err.to_string(),
+            "A payload reached EOF, but is not complete. Inner error: None"
         );
     }
 
     macro_rules! from {
         ($from:expr => $error:pat) => {
             match ParseError::from($from) {
-                e @ $error => {
-                    assert!(format!("{}", e).len() >= 5);
+                err @ $error => {
+                    assert!(err.to_string().len() >= 5);
                 }
-                e => unreachable!("{:?}", e),
+                err => unreachable!("{:?}", err),
             }
         };
     }
@@ -1083,7 +1089,7 @@ mod tests {
         let err = PayloadError::Overflow;
         let resp_err: &dyn ResponseError = &err;
         let err = resp_err.downcast_ref::<PayloadError>().unwrap();
-        assert_eq!(err.to_string(), "A payload reached size limit.");
+        assert_eq!(err.to_string(), "Payload reached size limit.");
         let not_err = resp_err.downcast_ref::<ContentTypeError>();
         assert!(not_err.is_none());
     }

@@ -3,24 +3,25 @@ use std::marker::PhantomData;
 use std::time::Duration;
 
 use actix_codec::{AsyncRead, AsyncWrite};
-use actix_connect::{
+use actix_rt::net::TcpStream;
+use actix_service::{apply_fn, Service, ServiceExt};
+use actix_tls::connect::{
     default_connector, Connect as TcpConnect, Connection as TcpConnection,
 };
-use actix_rt::net::TcpStream;
-use actix_service::{apply_fn, Service};
 use actix_utils::timeout::{TimeoutError, TimeoutService};
 use http::Uri;
 
+use super::config::ConnectorConfig;
 use super::connection::Connection;
 use super::error::ConnectError;
 use super::pool::{ConnectionPool, Protocol};
 use super::Connect;
 
 #[cfg(feature = "openssl")]
-use actix_connect::ssl::openssl::SslConnector as OpensslConnector;
+use actix_tls::connect::ssl::openssl::SslConnector as OpensslConnector;
 
 #[cfg(feature = "rustls")]
-use actix_connect::ssl::rustls::ClientConfig;
+use actix_tls::connect::ssl::rustls::ClientConfig;
 #[cfg(feature = "rustls")]
 use std::sync::Arc;
 
@@ -48,14 +49,10 @@ type SslConnector = ();
 /// ```
 pub struct Connector<T, U> {
     connector: T,
-    timeout: Duration,
-    conn_lifetime: Duration,
-    conn_keep_alive: Duration,
-    disconnect_timeout: Duration,
-    limit: usize,
+    config: ConnectorConfig,
     #[allow(dead_code)]
     ssl: SslConnector,
-    _t: PhantomData<U>,
+    _phantom: PhantomData<U>,
 }
 
 trait Io: AsyncRead + AsyncWrite + Unpin {}
@@ -65,48 +62,53 @@ impl Connector<(), ()> {
     #[allow(clippy::new_ret_no_self, clippy::let_unit_value)]
     pub fn new() -> Connector<
         impl Service<
-                Request = TcpConnect<Uri>,
+                TcpConnect<Uri>,
                 Response = TcpConnection<Uri, TcpStream>,
-                Error = actix_connect::ConnectError,
+                Error = actix_tls::connect::ConnectError,
             > + Clone,
         TcpStream,
     > {
-        let ssl = {
-            #[cfg(feature = "openssl")]
-            {
-                use actix_connect::ssl::openssl::SslMethod;
-
-                let mut ssl = OpensslConnector::builder(SslMethod::tls()).unwrap();
-                let _ = ssl
-                    .set_alpn_protos(b"\x02h2\x08http/1.1")
-                    .map_err(|e| error!("Can not set alpn protocol: {:?}", e));
-                SslConnector::Openssl(ssl.build())
-            }
-            #[cfg(all(not(feature = "openssl"), feature = "rustls"))]
-            {
-                let protos = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-                let mut config = ClientConfig::new();
-                config.set_protocols(&protos);
-                config
-                    .root_store
-                    .add_server_trust_anchors(&actix_tls::rustls::TLS_SERVER_ROOTS);
-                SslConnector::Rustls(Arc::new(config))
-            }
-            #[cfg(not(any(feature = "openssl", feature = "rustls")))]
-            {}
-        };
-
         Connector {
-            ssl,
+            ssl: Self::build_ssl(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
             connector: default_connector(),
-            timeout: Duration::from_secs(1),
-            conn_lifetime: Duration::from_secs(75),
-            conn_keep_alive: Duration::from_secs(15),
-            disconnect_timeout: Duration::from_millis(3000),
-            limit: 100,
-            _t: PhantomData,
+            config: ConnectorConfig::default(),
+            _phantom: PhantomData,
         }
     }
+
+    // Build Ssl connector with openssl, based on supplied alpn protocols
+    #[cfg(feature = "openssl")]
+    fn build_ssl(protocols: Vec<Vec<u8>>) -> SslConnector {
+        use actix_tls::connect::ssl::openssl::SslMethod;
+        use bytes::{BufMut, BytesMut};
+
+        let mut alpn = BytesMut::with_capacity(20);
+        for proto in protocols.iter() {
+            alpn.put_u8(proto.len() as u8);
+            alpn.put(proto.as_slice());
+        }
+
+        let mut ssl = OpensslConnector::builder(SslMethod::tls()).unwrap();
+        let _ = ssl
+            .set_alpn_protos(&alpn)
+            .map_err(|e| error!("Can not set alpn protocol: {:?}", e));
+        SslConnector::Openssl(ssl.build())
+    }
+
+    // Build Ssl connector with rustls, based on supplied alpn protocols
+    #[cfg(all(not(feature = "openssl"), feature = "rustls"))]
+    fn build_ssl(protocols: Vec<Vec<u8>>) -> SslConnector {
+        let mut config = ClientConfig::new();
+        config.set_protocols(&protocols);
+        config
+            .root_store
+            .add_server_trust_anchors(&actix_tls::accept::rustls::TLS_SERVER_ROOTS);
+        SslConnector::Rustls(Arc::new(config))
+    }
+
+    // ssl turned off, provides empty ssl connector
+    #[cfg(not(any(feature = "openssl", feature = "rustls")))]
+    fn build_ssl(_: Vec<Vec<u8>>) -> SslConnector {}
 }
 
 impl<T, U> Connector<T, U> {
@@ -115,20 +117,16 @@ impl<T, U> Connector<T, U> {
     where
         U1: AsyncRead + AsyncWrite + Unpin + fmt::Debug,
         T1: Service<
-                Request = TcpConnect<Uri>,
+                TcpConnect<Uri>,
                 Response = TcpConnection<Uri, U1>,
-                Error = actix_connect::ConnectError,
+                Error = actix_tls::connect::ConnectError,
             > + Clone,
     {
         Connector {
             connector,
-            timeout: self.timeout,
-            conn_lifetime: self.conn_lifetime,
-            conn_keep_alive: self.conn_keep_alive,
-            disconnect_timeout: self.disconnect_timeout,
-            limit: self.limit,
+            config: self.config,
             ssl: self.ssl,
-            _t: PhantomData,
+            _phantom: PhantomData,
         }
     }
 }
@@ -137,16 +135,16 @@ impl<T, U> Connector<T, U>
 where
     U: AsyncRead + AsyncWrite + Unpin + fmt::Debug + 'static,
     T: Service<
-            Request = TcpConnect<Uri>,
+            TcpConnect<Uri>,
             Response = TcpConnection<Uri, U>,
-            Error = actix_connect::ConnectError,
+            Error = actix_tls::connect::ConnectError,
         > + Clone
         + 'static,
 {
     /// Connection timeout, i.e. max time to connect to remote host including dns name resolution.
     /// Set to 1 second by default.
     pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+        self.config.timeout = timeout;
         self
     }
 
@@ -163,12 +161,44 @@ where
         self
     }
 
+    /// Maximum supported http major version
+    /// Supported versions http/1.1, http/2
+    pub fn max_http_version(mut self, val: http::Version) -> Self {
+        let versions = match val {
+            http::Version::HTTP_11 => vec![b"http/1.1".to_vec()],
+            http::Version::HTTP_2 => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            _ => {
+                unimplemented!("actix-http:client: supported versions http/1.1, http/2")
+            }
+        };
+        self.ssl = Connector::build_ssl(versions);
+        self
+    }
+
+    /// Indicates the initial window size (in octets) for
+    /// HTTP2 stream-level flow control for received data.
+    ///
+    /// The default value is 65,535 and is good for APIs, but not for big objects.
+    pub fn initial_window_size(mut self, size: u32) -> Self {
+        self.config.stream_window_size = size;
+        self
+    }
+
+    /// Indicates the initial window size (in octets) for
+    /// HTTP2 connection-level flow control for received data.
+    ///
+    /// The default value is 65,535 and is good for APIs, but not for big objects.
+    pub fn initial_connection_window_size(mut self, size: u32) -> Self {
+        self.config.conn_window_size = size;
+        self
+    }
+
     /// Set total number of simultaneous connections per type of scheme.
     ///
     /// If limit is 0, the connector has no limit.
     /// The default limit size is 100.
     pub fn limit(mut self, limit: usize) -> Self {
-        self.limit = limit;
+        self.config.limit = limit;
         self
     }
 
@@ -179,7 +209,7 @@ where
     /// exceeds this period, the connection is closed.
     /// Default keep-alive period is 15 seconds.
     pub fn conn_keep_alive(mut self, dur: Duration) -> Self {
-        self.conn_keep_alive = dur;
+        self.config.conn_keep_alive = dur;
         self
     }
 
@@ -189,7 +219,7 @@ where
     /// until it is closed regardless of keep-alive period.
     /// Default lifetime period is 75 seconds.
     pub fn conn_lifetime(mut self, dur: Duration) -> Self {
-        self.conn_lifetime = dur;
+        self.config.conn_lifetime = dur;
         self
     }
 
@@ -202,7 +232,7 @@ where
     ///
     /// By default disconnect timeout is set to 3000 milliseconds.
     pub fn disconnect_timeout(mut self, dur: Duration) -> Self {
-        self.disconnect_timeout = dur;
+        self.config.disconnect_timeout = Some(dur);
         self
     }
 
@@ -211,12 +241,12 @@ where
     /// its combinator chain.
     pub fn finish(
         self,
-    ) -> impl Service<Request = Connect, Response = impl Connection, Error = ConnectError>
-           + Clone {
+    ) -> impl Service<Connect, Response = impl Connection, Error = ConnectError> + Clone
+    {
         #[cfg(not(any(feature = "openssl", feature = "rustls")))]
         {
             let connector = TimeoutService::new(
-                self.timeout,
+                self.config.timeout,
                 apply_fn(self.connector, |msg: Connect, srv| {
                     srv.call(TcpConnect::new(msg.uri).set_addr(msg.addr))
                 })
@@ -231,24 +261,21 @@ where
             connect_impl::InnerConnector {
                 tcp_pool: ConnectionPool::new(
                     connector,
-                    self.conn_lifetime,
-                    self.conn_keep_alive,
-                    None,
-                    self.limit,
+                    self.config.no_disconnect_timeout(),
                 ),
             }
         }
         #[cfg(any(feature = "openssl", feature = "rustls"))]
         {
             const H2: &[u8] = b"h2";
-            #[cfg(feature = "openssl")]
-            use actix_connect::ssl::openssl::OpensslConnector;
-            #[cfg(feature = "rustls")]
-            use actix_connect::ssl::rustls::{RustlsConnector, Session};
             use actix_service::{boxed::service, pipeline};
+            #[cfg(feature = "openssl")]
+            use actix_tls::connect::ssl::openssl::OpensslConnector;
+            #[cfg(feature = "rustls")]
+            use actix_tls::connect::ssl::rustls::{RustlsConnector, Session};
 
             let ssl_service = TimeoutService::new(
-                self.timeout,
+                self.config.timeout,
                 pipeline(
                     apply_fn(self.connector.clone(), |msg: Connect, srv| {
                         srv.call(TcpConnect::new(msg.uri).set_addr(msg.addr))
@@ -301,7 +328,7 @@ where
             });
 
             let tcp_service = TimeoutService::new(
-                self.timeout,
+                self.config.timeout,
                 apply_fn(self.connector, |msg: Connect, srv| {
                     srv.call(TcpConnect::new(msg.uri).set_addr(msg.addr))
                 })
@@ -316,18 +343,9 @@ where
             connect_impl::InnerConnector {
                 tcp_pool: ConnectionPool::new(
                     tcp_service,
-                    self.conn_lifetime,
-                    self.conn_keep_alive,
-                    None,
-                    self.limit,
+                    self.config.no_disconnect_timeout(),
                 ),
-                ssl_pool: ConnectionPool::new(
-                    ssl_service,
-                    self.conn_lifetime,
-                    self.conn_keep_alive,
-                    Some(self.disconnect_timeout),
-                    self.limit,
-                ),
+                ssl_pool: ConnectionPool::new(ssl_service, self.config),
             }
         }
     }
@@ -345,8 +363,7 @@ mod connect_impl {
     pub(crate) struct InnerConnector<T, Io>
     where
         Io: AsyncRead + AsyncWrite + Unpin + 'static,
-        T: Service<Request = Connect, Response = (Io, Protocol), Error = ConnectError>
-            + 'static,
+        T: Service<Connect, Response = (Io, Protocol), Error = ConnectError> + 'static,
     {
         pub(crate) tcp_pool: ConnectionPool<T, Io>,
     }
@@ -354,8 +371,7 @@ mod connect_impl {
     impl<T, Io> Clone for InnerConnector<T, Io>
     where
         Io: AsyncRead + AsyncWrite + Unpin + 'static,
-        T: Service<Request = Connect, Response = (Io, Protocol), Error = ConnectError>
-            + 'static,
+        T: Service<Connect, Response = (Io, Protocol), Error = ConnectError> + 'static,
     {
         fn clone(&self) -> Self {
             InnerConnector {
@@ -364,17 +380,15 @@ mod connect_impl {
         }
     }
 
-    impl<T, Io> Service for InnerConnector<T, Io>
+    impl<T, Io> Service<Connect> for InnerConnector<T, Io>
     where
         Io: AsyncRead + AsyncWrite + Unpin + 'static,
-        T: Service<Request = Connect, Response = (Io, Protocol), Error = ConnectError>
-            + 'static,
+        T: Service<Connect, Response = (Io, Protocol), Error = ConnectError> + 'static,
     {
-        type Request = Connect;
         type Response = IoConnection<Io>;
         type Error = ConnectError;
         type Future = Either<
-            <ConnectionPool<T, Io> as Service>::Future,
+            <ConnectionPool<T, Io> as Service<Connect>>::Future,
             Ready<Result<IoConnection<Io>, ConnectError>>,
         >;
 
@@ -410,8 +424,8 @@ mod connect_impl {
     where
         Io1: AsyncRead + AsyncWrite + Unpin + 'static,
         Io2: AsyncRead + AsyncWrite + Unpin + 'static,
-        T1: Service<Request = Connect, Response = (Io1, Protocol), Error = ConnectError>,
-        T2: Service<Request = Connect, Response = (Io2, Protocol), Error = ConnectError>,
+        T1: Service<Connect, Response = (Io1, Protocol), Error = ConnectError>,
+        T2: Service<Connect, Response = (Io2, Protocol), Error = ConnectError>,
     {
         pub(crate) tcp_pool: ConnectionPool<T1, Io1>,
         pub(crate) ssl_pool: ConnectionPool<T2, Io2>,
@@ -421,10 +435,8 @@ mod connect_impl {
     where
         Io1: AsyncRead + AsyncWrite + Unpin + 'static,
         Io2: AsyncRead + AsyncWrite + Unpin + 'static,
-        T1: Service<Request = Connect, Response = (Io1, Protocol), Error = ConnectError>
-            + 'static,
-        T2: Service<Request = Connect, Response = (Io2, Protocol), Error = ConnectError>
-            + 'static,
+        T1: Service<Connect, Response = (Io1, Protocol), Error = ConnectError> + 'static,
+        T2: Service<Connect, Response = (Io2, Protocol), Error = ConnectError> + 'static,
     {
         fn clone(&self) -> Self {
             InnerConnector {
@@ -434,16 +446,13 @@ mod connect_impl {
         }
     }
 
-    impl<T1, T2, Io1, Io2> Service for InnerConnector<T1, T2, Io1, Io2>
+    impl<T1, T2, Io1, Io2> Service<Connect> for InnerConnector<T1, T2, Io1, Io2>
     where
         Io1: AsyncRead + AsyncWrite + Unpin + 'static,
         Io2: AsyncRead + AsyncWrite + Unpin + 'static,
-        T1: Service<Request = Connect, Response = (Io1, Protocol), Error = ConnectError>
-            + 'static,
-        T2: Service<Request = Connect, Response = (Io2, Protocol), Error = ConnectError>
-            + 'static,
+        T1: Service<Connect, Response = (Io1, Protocol), Error = ConnectError> + 'static,
+        T2: Service<Connect, Response = (Io2, Protocol), Error = ConnectError> + 'static,
     {
-        type Request = Connect;
         type Response = EitherConnection<Io1, Io2>;
         type Error = ConnectError;
         type Future = Either<
@@ -459,11 +468,11 @@ mod connect_impl {
             match req.uri.scheme_str() {
                 Some("https") | Some("wss") => Either::Right(InnerConnectorResponseB {
                     fut: self.ssl_pool.call(req),
-                    _t: PhantomData,
+                    _phantom: PhantomData,
                 }),
                 _ => Either::Left(InnerConnectorResponseA {
                     fut: self.tcp_pool.call(req),
-                    _t: PhantomData,
+                    _phantom: PhantomData,
                 }),
             }
         }
@@ -473,18 +482,16 @@ mod connect_impl {
     pub(crate) struct InnerConnectorResponseA<T, Io1, Io2>
     where
         Io1: AsyncRead + AsyncWrite + Unpin + 'static,
-        T: Service<Request = Connect, Response = (Io1, Protocol), Error = ConnectError>
-            + 'static,
+        T: Service<Connect, Response = (Io1, Protocol), Error = ConnectError> + 'static,
     {
         #[pin]
-        fut: <ConnectionPool<T, Io1> as Service>::Future,
-        _t: PhantomData<Io2>,
+        fut: <ConnectionPool<T, Io1> as Service<Connect>>::Future,
+        _phantom: PhantomData<Io2>,
     }
 
     impl<T, Io1, Io2> Future for InnerConnectorResponseA<T, Io1, Io2>
     where
-        T: Service<Request = Connect, Response = (Io1, Protocol), Error = ConnectError>
-            + 'static,
+        T: Service<Connect, Response = (Io1, Protocol), Error = ConnectError> + 'static,
         Io1: AsyncRead + AsyncWrite + Unpin + 'static,
         Io2: AsyncRead + AsyncWrite + Unpin + 'static,
     {
@@ -502,18 +509,16 @@ mod connect_impl {
     pub(crate) struct InnerConnectorResponseB<T, Io1, Io2>
     where
         Io2: AsyncRead + AsyncWrite + Unpin + 'static,
-        T: Service<Request = Connect, Response = (Io2, Protocol), Error = ConnectError>
-            + 'static,
+        T: Service<Connect, Response = (Io2, Protocol), Error = ConnectError> + 'static,
     {
         #[pin]
-        fut: <ConnectionPool<T, Io2> as Service>::Future,
-        _t: PhantomData<Io1>,
+        fut: <ConnectionPool<T, Io2> as Service<Connect>>::Future,
+        _phantom: PhantomData<Io1>,
     }
 
     impl<T, Io1, Io2> Future for InnerConnectorResponseB<T, Io1, Io2>
     where
-        T: Service<Request = Connect, Response = (Io2, Protocol), Error = ConnectError>
-            + 'static,
+        T: Service<Connect, Response = (Io2, Protocol), Error = ConnectError> + 'static,
         Io1: AsyncRead + AsyncWrite + Unpin + 'static,
         Io2: AsyncRead + AsyncWrite + Unpin + 'static,
     {

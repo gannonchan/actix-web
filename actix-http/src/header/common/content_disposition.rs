@@ -1,10 +1,10 @@
-// # References
-//
-// "The Content-Disposition Header Field" https://www.ietf.org/rfc/rfc2183.txt
-// "The Content-Disposition Header Field in the Hypertext Transfer Protocol (HTTP)" https://www.ietf.org/rfc/rfc6266.txt
-// "Returning Values from Forms: multipart/form-data" https://www.ietf.org/rfc/rfc7578.txt
-// Browser conformance tests at: http://greenbytes.de/tech/tc2231/
-// IANA assignment: http://www.iana.org/assignments/cont-disp/cont-disp.xhtml
+//! # References
+//!
+//! "The Content-Disposition Header Field" https://www.ietf.org/rfc/rfc2183.txt
+//! "The Content-Disposition Header Field in the Hypertext Transfer Protocol (HTTP)" https://www.ietf.org/rfc/rfc6266.txt
+//! "Returning Values from Forms: multipart/form-data" https://www.ietf.org/rfc/rfc7578.txt
+//! Browser conformance tests at: http://greenbytes.de/tech/tc2231/
+//! IANA assignment: http://www.iana.org/assignments/cont-disp/cont-disp.xhtml
 
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -90,40 +90,40 @@ pub enum DispositionParam {
     /// [RFC6266](https://tools.ietf.org/html/rfc6266) as *token "=" value*. Recipients should
     /// ignore unrecognizable parameters.
     Unknown(String, String),
-    /// An unrecognized extended paramater as defined in
+    /// An unrecognized extended parameter as defined in
     /// [RFC5987](https://tools.ietf.org/html/rfc5987) as *ext-parameter*, in
     /// [RFC6266](https://tools.ietf.org/html/rfc6266) as *ext-token "=" ext-value*. The single
-    /// trailling asterisk is not included. Recipients should ignore unrecognizable parameters.
+    /// trailing asterisk is not included. Recipients should ignore unrecognizable parameters.
     UnknownExt(String, ExtendedValue),
 }
 
 impl DispositionParam {
-    /// Returns `true` if the paramater is [`Name`](DispositionParam::Name).
+    /// Returns `true` if the parameter is [`Name`](DispositionParam::Name).
     #[inline]
     pub fn is_name(&self) -> bool {
         self.as_name().is_some()
     }
 
-    /// Returns `true` if the paramater is [`Filename`](DispositionParam::Filename).
+    /// Returns `true` if the parameter is [`Filename`](DispositionParam::Filename).
     #[inline]
     pub fn is_filename(&self) -> bool {
         self.as_filename().is_some()
     }
 
-    /// Returns `true` if the paramater is [`FilenameExt`](DispositionParam::FilenameExt).
+    /// Returns `true` if the parameter is [`FilenameExt`](DispositionParam::FilenameExt).
     #[inline]
     pub fn is_filename_ext(&self) -> bool {
         self.as_filename_ext().is_some()
     }
 
-    /// Returns `true` if the paramater is [`Unknown`](DispositionParam::Unknown) and the `name`
+    /// Returns `true` if the parameter is [`Unknown`](DispositionParam::Unknown) and the `name`
     #[inline]
     /// matches.
     pub fn is_unknown<T: AsRef<str>>(&self, name: T) -> bool {
         self.as_unknown(name).is_some()
     }
 
-    /// Returns `true` if the paramater is [`UnknownExt`](DispositionParam::UnknownExt) and the
+    /// Returns `true` if the parameter is [`UnknownExt`](DispositionParam::UnknownExt) and the
     /// `name` matches.
     #[inline]
     pub fn is_unknown_ext<T: AsRef<str>>(&self, name: T) -> bool {
@@ -283,11 +283,11 @@ impl DispositionParam {
 ///            Some("\u{1f600}.svg".as_bytes()));
 /// ```
 ///
-/// # WARN
+/// # Security Note
+///
 /// If "filename" parameter is supplied, do not use the file name blindly, check and possibly
 /// change to match local file system conventions if applicable, and do not use directory path
-/// information that may be present. See [RFC2183](https://tools.ietf.org/html/rfc2183#section-2.3)
-/// .
+/// information that may be present. See [RFC2183](https://tools.ietf.org/html/rfc2183#section-2.3).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContentDisposition {
     /// The disposition type
@@ -318,9 +318,8 @@ impl ContentDisposition {
                 return Err(crate::error::ParseError::Header);
             }
             left = new_left;
-            if param_name.ends_with('*') {
+            if let Some(param_name) = param_name.strip_suffix('*') {
                 // extended parameters
-                let param_name = &param_name[..param_name.len() - 1]; // trim asterisk
                 let (ext_value, new_left) = split_once_and_trim(left, ';');
                 left = new_left;
                 let ext_value = header::parse_extended_value(ext_value)?;
@@ -373,7 +372,7 @@ impl ContentDisposition {
                 let param = if param_name.eq_ignore_ascii_case("name") {
                     DispositionParam::Name(value)
                 } else if param_name.eq_ignore_ascii_case("filename") {
-                    // See also comments in test_from_raw_uncessary_percent_decode.
+                    // See also comments in test_from_raw_unnecessary_percent_decode.
                     DispositionParam::Filename(value)
                 } else {
                     DispositionParam::Unknown(param_name.to_owned(), value)
@@ -387,26 +386,17 @@ impl ContentDisposition {
 
     /// Returns `true` if it is [`Inline`](DispositionType::Inline).
     pub fn is_inline(&self) -> bool {
-        match self.disposition {
-            DispositionType::Inline => true,
-            _ => false,
-        }
+        matches!(self.disposition, DispositionType::Inline)
     }
 
     /// Returns `true` if it is [`Attachment`](DispositionType::Attachment).
     pub fn is_attachment(&self) -> bool {
-        match self.disposition {
-            DispositionType::Attachment => true,
-            _ => false,
-        }
+        matches!(self.disposition, DispositionType::Attachment)
     }
 
     /// Returns `true` if it is [`FormData`](DispositionType::FormData).
     pub fn is_form_data(&self) -> bool {
-        match self.disposition {
-            DispositionType::FormData => true,
-            _ => false,
-        }
+        matches!(self.disposition, DispositionType::FormData)
     }
 
     /// Returns `true` if it is [`Ext`](DispositionType::Ext) and the `disp_type` matches.
@@ -423,7 +413,7 @@ impl ContentDisposition {
 
     /// Return the value of *name* if exists.
     pub fn get_name(&self) -> Option<&str> {
-        self.parameters.iter().filter_map(|p| p.as_name()).nth(0)
+        self.parameters.iter().filter_map(|p| p.as_name()).next()
     }
 
     /// Return the value of *filename* if exists.
@@ -431,7 +421,7 @@ impl ContentDisposition {
         self.parameters
             .iter()
             .filter_map(|p| p.as_filename())
-            .nth(0)
+            .next()
     }
 
     /// Return the value of *filename\** if exists.
@@ -439,7 +429,7 @@ impl ContentDisposition {
         self.parameters
             .iter()
             .filter_map(|p| p.as_filename_ext())
-            .nth(0)
+            .next()
     }
 
     /// Return the value of the parameter which the `name` matches.
@@ -448,7 +438,7 @@ impl ContentDisposition {
         self.parameters
             .iter()
             .filter_map(|p| p.as_unknown(name))
-            .nth(0)
+            .next()
     }
 
     /// Return the value of the extended parameter which the `name` matches.
@@ -457,14 +447,14 @@ impl ContentDisposition {
         self.parameters
             .iter()
             .filter_map(|p| p.as_unknown_ext(name))
-            .nth(0)
+            .next()
     }
 }
 
 impl IntoHeaderValue for ContentDisposition {
     type Error = header::InvalidHeaderValue;
 
-    fn try_into(self) -> Result<header::HeaderValue, Self::Error> {
+    fn try_into_value(self) -> Result<header::HeaderValue, Self::Error> {
         let mut writer = Writer::new();
         let _ = write!(&mut writer, "{}", self);
         header::HeaderValue::from_maybe_shared(writer.take())
@@ -529,7 +519,7 @@ impl fmt::Display for DispositionParam {
         //               ; to use within parameter values
         //
         //
-        // See also comments in test_from_raw_uncessary_percent_decode.
+        // See also comments in test_from_raw_unnecessary_percent_decode.
         lazy_static! {
             static ref RE: Regex = Regex::new("[\x00-\x08\x10-\x1F\x7F\"\\\\]").unwrap();
         }
@@ -559,8 +549,7 @@ impl fmt::Display for ContentDisposition {
         write!(f, "{}", self.disposition)?;
         self.parameters
             .iter()
-            .map(|param| write!(f, "; {}", param))
-            .collect()
+            .try_for_each(|param| write!(f, "; {}", param))
     }
 }
 
@@ -676,7 +665,7 @@ mod tests {
     fn test_from_raw_unordered() {
         let a = HeaderValue::from_static(
             "form-data; dummy=3; filename=\"sample.png\" ; name=upload;",
-            // Actually, a trailling semolocon is not compliant. But it is fine to accept.
+            // Actually, a trailing semicolon is not compliant. But it is fine to accept.
         );
         let a: ContentDisposition = ContentDisposition::from_raw(&a).unwrap();
         let b = ContentDisposition {
@@ -833,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_raw_uncessary_percent_decode() {
+    fn test_from_raw_unnecessary_percent_decode() {
         // In fact, RFC7578 (multipart/form-data) Section 2 and 4.2 suggests that filename with
         // non-ASCII characters MAY be percent-encoded.
         // On the contrary, RFC6266 or other RFCs related to Content-Disposition response header

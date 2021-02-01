@@ -1,6 +1,6 @@
 [package]
 name = "actix-web-actors"
-version = "2.0.0"
+version = "4.0.0-beta.1"
 authors = ["Nikolay Kim <fafhrd91@gmail.com>"]
 description = "Actix actors support for actix web framework."
 readme = "README.md"
@@ -8,7 +8,7 @@ keywords = ["actix", "http", "web", "framework", "async"]
 homepage = "https://actix.rs"
 repository = "https://github.com/actix/actix-web.git"
 documentation = "https://docs.rs/actix-web-actors/"
-license = "MIT/Apache-2.0"
+license = "MIT OR Apache-2.0"
 edition = "2018"
 
 [lib]
@@ -16,14 +16,18 @@ name = "actix_web_actors"
 path = "src/lib.rs"
 
 [dependencies]
-actix = "0.9.0"
-actix-web = "2.0.0-rc"
-actix-http = "1.0.1"
-actix-codec = "0.2.0"
-bytes = "0.5.2"
-futures = "0.3.1"
-pin-project = "0.4.6"
+actix = "0.11.0-beta.1"
+actix-codec = "0.4.0-beta.1"
+actix-http = "3.0.0-beta.1"
+actix-web = { version = "4.0.0-beta.1", default-features = false }
+
+bytes = "1"
+bytestring = "1"
+futures-core = { version = "0.3.7", default-features = false }
+pin-project = "1.0.0"
+tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
-actix-rt = "1.0.0"
-env_logger = "0.6"
+actix-rt = "2.0.0-beta.2"
+env_logger = "0.7"
+futures-util = { version = "0.3.7", default-features = false }

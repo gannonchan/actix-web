@@ -1,10 +1,10 @@
 use std::io;
 
-use actix_connect::resolver::ResolveError;
+use actix_tls::connect::resolver::ResolveError;
 use derive_more::{Display, From};
 
 #[cfg(feature = "openssl")]
-use actix_connect::ssl::openssl::{HandshakeError, SslError};
+use actix_tls::accept::openssl::SslError;
 
 use crate::error::{Error, ParseError, ResponseError};
 use crate::http::{Error as HttpError, StatusCode};
@@ -21,11 +21,6 @@ pub enum ConnectError {
     #[display(fmt = "{}", _0)]
     SslError(SslError),
 
-    /// SSL Handshake error
-    #[cfg(feature = "openssl")]
-    #[display(fmt = "{}", _0)]
-    SslHandshakeError(String),
-
     /// Failed to resolve the hostname
     #[display(fmt = "Failed resolving hostname: {}", _0)]
     Resolver(ResolveError),
@@ -39,7 +34,7 @@ pub enum ConnectError {
     H2(h2::Error),
 
     /// Connecting took too long
-    #[display(fmt = "Timeout out while establishing connection")]
+    #[display(fmt = "Timeout while establishing connection")]
     Timeout,
 
     /// Connector has been disconnected
@@ -48,29 +43,24 @@ pub enum ConnectError {
 
     /// Unresolved host name
     #[display(fmt = "Connector received `Connect` method with unresolved host")]
-    Unresolverd,
+    Unresolved,
 
     /// Connection io error
     #[display(fmt = "{}", _0)]
     Io(io::Error),
 }
 
-impl From<actix_connect::ConnectError> for ConnectError {
-    fn from(err: actix_connect::ConnectError) -> ConnectError {
-        match err {
-            actix_connect::ConnectError::Resolver(e) => ConnectError::Resolver(e),
-            actix_connect::ConnectError::NoRecords => ConnectError::NoRecords,
-            actix_connect::ConnectError::InvalidInput => panic!(),
-            actix_connect::ConnectError::Unresolverd => ConnectError::Unresolverd,
-            actix_connect::ConnectError::Io(e) => ConnectError::Io(e),
-        }
-    }
-}
+impl std::error::Error for ConnectError {}
 
-#[cfg(feature = "openssl")]
-impl<T: std::fmt::Debug> From<HandshakeError<T>> for ConnectError {
-    fn from(err: HandshakeError<T>) -> ConnectError {
-        ConnectError::SslHandshakeError(format!("{:?}", err))
+impl From<actix_tls::connect::ConnectError> for ConnectError {
+    fn from(err: actix_tls::connect::ConnectError) -> ConnectError {
+        match err {
+            actix_tls::connect::ConnectError::Resolver(e) => ConnectError::Resolver(e),
+            actix_tls::connect::ConnectError::NoRecords => ConnectError::NoRecords,
+            actix_tls::connect::ConnectError::InvalidInput => panic!(),
+            actix_tls::connect::ConnectError::Unresolved => ConnectError::Unresolved,
+            actix_tls::connect::ConnectError::Io(e) => ConnectError::Io(e),
+        }
     }
 }
 
@@ -85,6 +75,8 @@ pub enum InvalidUrl {
     #[display(fmt = "Url parse error: {}", _0)]
     HttpError(http::Error),
 }
+
+impl std::error::Error for InvalidUrl {}
 
 /// A set of errors that can occur during request sending and response reading
 #[derive(Debug, Display, From)]
@@ -106,7 +98,7 @@ pub enum SendRequestError {
     #[display(fmt = "{}", _0)]
     H2(h2::Error),
     /// Response took too long
-    #[display(fmt = "Timeout out while waiting for response")]
+    #[display(fmt = "Timeout while waiting for response")]
     Timeout,
     /// Tunnels are not supported for http2 connection
     #[display(fmt = "Tunnels are not supported for http2 connection")]
@@ -114,6 +106,8 @@ pub enum SendRequestError {
     /// Error sending request body
     Body(Error),
 }
+
+impl std::error::Error for SendRequestError {}
 
 /// Convert `SendRequestError` to a server `Response`
 impl ResponseError for SendRequestError {
@@ -138,6 +132,8 @@ pub enum FreezeRequestError {
     #[display(fmt = "{}", _0)]
     Http(HttpError),
 }
+
+impl std::error::Error for FreezeRequestError {}
 
 impl From<FreezeRequestError> for SendRequestError {
     fn from(e: FreezeRequestError) -> Self {

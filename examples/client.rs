@@ -1,6 +1,6 @@
 use actix_http::Error;
 
-#[actix_rt::main]
+#[actix_web::main]
 async fn main() -> Result<(), Error> {
     std::env::set_var("RUST_LOG", "actix_http=trace");
     env_logger::init();
@@ -10,7 +10,7 @@ async fn main() -> Result<(), Error> {
     // Create request builder, configure request and send
     let mut response = client
         .get("https://www.rust-lang.org/")
-        .header("User-Agent", "Actix-web")
+        .append_header(("User-Agent", "Actix-web"))
         .send()
         .await?;
 
